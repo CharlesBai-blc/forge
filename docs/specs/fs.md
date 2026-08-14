@@ -1,6 +1,6 @@
 # Forge - Functional Specification
 
-**Version:** 1.1 | **Date:** August 13, 2026 | **Owner:** Charles Bai
+**Version:** 1.2 | **Date:** August 14, 2026 | **Owner:** Charles Bai
 **Scope authority:** Project Charter v1.0.
 **Companion doc:** Technical Design Document (architecture, data model, API surface). This document defines what Forge does. The TDD defines how.
 
@@ -41,21 +41,21 @@ Requirements are numbered for traceability. Tests and PRs reference them. [Mx] m
 ### 3.1 Installation and setup
 
 - **FR-1 [M1]** `install.sh` installs the `forge` binary on Linux (x86_64, arm64). `forge install` registers a systemd service.
-- **FR-2 [M1]** First run provides a setup flow (CLI at M1, web at M5) that captures admin credentials, GitHub credentials, and data directory. Config persists to a single file. Every option is settable via flags or env for scripted installs.
+- **FR-2 [M1]** First run provides a setup flow (CLI at M1, web at M5) that captures admin credentials, GitHub credentials, and data directory. Config persists across restarts in a form an operator can inspect and edit directly. Every option is settable via flags or env for scripted installs.
 - **FR-3 [M3]** The dashboard provides a copy-paste bootstrap command that installs `forge-agent` on a new machine, authenticates it with a one-time enrollment token, and joins it to the fleet.
 
 ### 3.2 GitHub integration (RunnerSource: `github`)
 
 - **FR-4 [M2]** Forge registers a just-in-time (JIT) ephemeral runner with GitHub for each incoming job, scoped to the configured repo or org. Jobs target Forge through standard `runs-on` labels with no workflow changes beyond the label.
 - **FR-5 [M2]** Runner registrations are single-use. A JIT runner is created for one job and never re-registered.
-- **FR-6 [M2]** Job status and logs report back through the standard runner protocol. The GitHub UI shows results exactly as with hosted runners.
+- **FR-6 [M2]** Job status and logs report back to GitHub as the job runs. The GitHub UI shows results exactly as with hosted runners.
 - **FR-7 [M2]** Supports repo-level registration, one configurable label set, and org-level registration if credentials allow. Multiple repos may share one Forge instance.
-- **FR-8 [M1 only]** An interim webhook-triggered execution mode exists to reduce M1 risk. It is deleted at M2 and is not documented.
+- **FR-8 [M1 only]** An interim, simplified trigger mechanism exists to reduce M1 risk. It is deleted at M2 in favor of FR-4's JIT flow and is not documented.
 
 ### 3.3 Job lifecycle and queue
 
 - **FR-9 [M1]** Jobs progress through explicit states: queued, assigned, running, then succeeded, failed, or lost. State history is persisted and queryable.
-- **FR-10 [M3]** Jobs queue in Redis Streams. Workers claim jobs via consumer groups. At M1 an embedded in-process queue is acceptable. Redis is required from M3 and ships in the provided compose file.
+- **FR-10 [M3]** Jobs queue durably; workers claim them per FR-11's delivery guarantees. At M1 an embedded in-process queue is acceptable. Whether a queue mechanism is required for every install is an open question (§7) resolved in the TDD.
 - **FR-11 [M3]** Delivery is at-least-once with idempotent claiming. A job assigned to a dead worker is reclaimed after a visibility timeout and re-dispatched. A job is never executed by two workers concurrently.
 - **FR-12 [M3]** A job that fails N times (default 2) moves to a dead-letter state, visible on the dashboard with logs, and reports to GitHub as failed.
 
@@ -82,7 +82,7 @@ Requirements are numbered for traceability. Tests and PRs reference them. [Mx] m
 ### 3.7 Dashboard and observability
 
 - **FR-24 [M3 basic, M5 full]** Embedded web dashboard shows queue depth, job list with states and durations, live log streaming per job, per-machine status and utilization, and burst activity.
-- **FR-25 [M4]** Control plane and agents expose Prometheus metrics: queue depth, job latency percentiles, sandbox start time, warm-pool hit rate. The benchmark consumes these.
+- **FR-25 [M4]** Control plane and agents expose machine-readable operational metrics: queue depth, job latency percentiles, sandbox start time, warm-pool hit rate. The benchmark consumes these.
 - **FR-26 [M2]** Structured logs throughout. A failed job's full diagnostic trail is retrievable from the dashboard alone.
 
 ### 3.8 Security and secrets
@@ -98,7 +98,7 @@ Requirements are numbered for traceability. Tests and PRs reference them. [Mx] m
 - **NFR-4 Scale target [M5]:** 5 workers, 50 concurrent jobs, 1,000 jobs per day sustained.
 - **NFR-5 Usability:** zero to first job in 10 minutes or less for Persona A, validated by at least one external tester.
 - **NFR-6 Portability:** Linux x86_64 and arm64. No CGO in the control plane unless required.
-- **NFR-7 Code quality:** CI runs build, vet, staticcheck, and tests with race detection on every PR. Failure-injection suite runs on main. Releases are tagged, versioned, and checksummed.
+- **NFR-7 Code quality:** CI runs build, vet, static analysis, and tests with race detection on every PR. Failure-injection suite runs on main. Releases are tagged, versioned, and checksummed.
 
 ## 5. Out of Scope for v1.0
 
@@ -108,7 +108,7 @@ GitLab, Gitea, and Bitbucket sources. Firecracker and gVisor sandboxes (planned 
 
 - **M1:** Push to a test repo triggers a job in a fresh container on one machine. Pass/fail visible in Forge logs. Test verifies the container is destroyed.
 - **M2:** Interim path deleted. JIT runner registered per job. Results appear in GitHub's UI. FR-27 credential handling in place.
-- **M3:** Two or more machines enrolled via bootstrap command. Redis Streams queue. Killing a worker mid-job results in reclamation and completion elsewhere. Drain works. Basic dashboard.
+- **M3:** Two or more machines enrolled via bootstrap command. Durable multi-worker queue in place. Killing a worker mid-job results in reclamation and completion elsewhere. Drain works. Basic dashboard.
 - **M4:** Warm pool meets NFR-1. Isolation suite (FR-17) and chaos suite (NFR-3) pass in CI. Threat model published.
 - **M5:** Flooding the queue triggers burst instances that absorb load, drain, and terminate within caps. Benchmark meets NFR-2. Forge runs its own CI. v1.0 tagged.
 
@@ -124,4 +124,4 @@ GitLab, Gitea, and Bitbucket sources. Firecracker and gVisor sandboxes (planned 
 
 PRs reference the FR and NFR IDs they implement or test. README claims link to the requirement and the test or benchmark backing them. This file changes only through versioned revision with a log entry.
 
-*Revision log:* v1.0 initial. v1.1 style cleanup, no scope changes.
+*Revision log:* v1.0 initial. v1.1 style cleanup, no scope changes. v1.2 replaced implementation-specific wording in FR-2, FR-6, FR-8, FR-10, FR-25, NFR-7, and the M3 acceptance criterion with behavior-level requirements, and resolved the FR-10/§7 open-question conflict. No end-behavior changes.
