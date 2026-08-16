@@ -258,6 +258,35 @@ func (s *Store) GetJob(ctx context.Context, id string) (*job.Job, error) {
 	return &j, nil
 }
 
+// ErrSecretNotFound is returned when GetSecret has no row for name.
+var ErrSecretNotFound = errors.New("store: secret not found")
+
+// PutSecret upserts an opaque ciphertext (FR-27).
+func (s *Store) PutSecret(ctx context.Context, name string, ciphertext []byte) error {
+	now := formatTime(time.Now().UTC())
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO secrets (name, ciphertext, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(name) DO UPDATE SET ciphertext = excluded.ciphertext, updated_at = excluded.updated_at`,
+		name, ciphertext, now)
+	if err != nil {
+		return fmt.Errorf("store: put secret %s: %w", name, err)
+	}
+	return nil
+}
+
+// GetSecret returns the ciphertext for name.
+func (s *Store) GetSecret(ctx context.Context, name string) ([]byte, error) {
+	var ciphertext []byte
+	err := s.db.QueryRowContext(ctx, `SELECT ciphertext FROM secrets WHERE name = ?`, name).Scan(&ciphertext)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrSecretNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: get secret %s: %w", name, err)
+	}
+	return ciphertext, nil
+}
+
 // Close closes the database.
 func (s *Store) Close() error {
 	return s.db.Close()
