@@ -39,12 +39,14 @@ type config struct {
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	if len(os.Args) > 1 && os.Args[1] == "enroll-token" {
-		if err := runEnrollToken(os.Args[2:], os.Stdout); err != nil {
-			log.Error("forge", "err", err)
-			os.Exit(1)
+	if len(os.Args) > 1 {
+		if run, ok := cliCommands[os.Args[1]]; ok {
+			if err := run(os.Args[2:], os.Stdout); err != nil {
+				log.Error("forge", "err", err)
+				os.Exit(1)
+			}
+			return
 		}
-		return
 	}
 	cfg := parseFlags()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -279,22 +281,34 @@ func runEnrollToken(args []string, stdout io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *dataDir == "" {
-		return fmt.Errorf("forge: -data-dir is required")
-	}
-	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
-		return fmt.Errorf("forge: data dir: %w", err)
-	}
-	ctx := context.Background()
-	st, err := store.Open(ctx, filepath.Join(*dataDir, "forge.db"))
+	st, err := openCLIStore(*dataDir)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	tok, err := st.IssueEnrollmentToken(ctx)
+	tok, err := st.IssueEnrollmentToken(context.Background())
 	if err != nil {
 		return err
 	}
 	_, err = fmt.Fprintln(stdout, tok)
 	return err
+}
+
+func openCLIStore(dataDir string) (*store.Store, error) {
+	if dataDir == "" {
+		return nil, fmt.Errorf("forge: -data-dir is required")
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return nil, fmt.Errorf("forge: data dir: %w", err)
+	}
+	return store.Open(context.Background(), filepath.Join(dataDir, "forge.db"))
+}
+
+var cliCommands = map[string]func([]string, io.Writer) error{
+	"enroll-token": runEnrollToken,
+	"workers":      runWorkers,
+	"cordon":       runCordon,
+	"uncordon":     runUncordon,
+	"drain":        runDrain,
+	"remove":       runRemove,
 }

@@ -160,6 +160,37 @@ func (s *Stream) AutoClaim(ctx context.Context, minIdle time.Duration) ([]Messag
 	return out, nil
 }
 
+// PendingFor returns PEL entries held by workerID.
+func (s *Stream) PendingFor(ctx context.Context, workerID string) ([]Message, error) {
+	pending, err := s.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream:   name,
+		Group:    group,
+		Start:    "-",
+		End:      "+",
+		Count:    100,
+		Consumer: workerID,
+	}).Result()
+	if err != nil {
+		return nil, fmt.Errorf("stream: xpending: %w", err)
+	}
+	out := make([]Message, 0, len(pending))
+	for _, p := range pending {
+		msgs, err := s.rdb.XRange(ctx, name, p.ID, p.ID).Result()
+		if err != nil {
+			return nil, fmt.Errorf("stream: xrange %s: %w", p.ID, err)
+		}
+		if len(msgs) == 0 {
+			continue
+		}
+		jobID, _ := msgs[0].Values["id"].(string)
+		if jobID == "" {
+			continue
+		}
+		out = append(out, Message{ID: p.ID, JobID: jobID})
+	}
+	return out, nil
+}
+
 // Reconcile XADDs queued job IDs that are missing from the stream (tdd.md §6.2).
 func (s *Stream) Reconcile(ctx context.Context, queued []string) error {
 	for _, id := range queued {

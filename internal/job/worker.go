@@ -30,9 +30,7 @@ type Worker struct {
 	Version   string
 }
 
-// workerTransitions is tdd.md §4.3. Drain and remove edges are
-// rejected until those features exist; listing them now keeps this
-// table from changing later.
+// workerTransitions is tdd.md §4.3.
 var workerTransitions = map[WorkerState]map[WorkerState]bool{
 	WorkerActive:   {WorkerCordoned: true, WorkerDraining: true, WorkerLost: true},
 	WorkerCordoned: {WorkerActive: true, WorkerDraining: true, WorkerLost: true, WorkerRemoved: true},

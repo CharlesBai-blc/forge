@@ -522,3 +522,88 @@ func TestSweepLeavesFreshClaim(t *testing.T) {
 		t.Fatalf("state = %s, want assigned", row.State)
 	}
 }
+
+func TestSweepDrainRequeuesAssigned(t *testing.T) {
+	st, jobs, _, c, src, h := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-drain", 11))
+	if _, err := c.Claim(context.Background()); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := st.TransitionWorker(context.Background(), c.WorkerID, job.WorkerDraining); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	row, err := st.GetJob(context.Background(), "job-drain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobQueued || row.Attempt != 0 || row.WorkerID != "" {
+		t.Fatalf("job = %+v", row)
+	}
+	if ids := src.unregisterIDs(); len(ids) != 1 || ids[0] != 1 {
+		t.Errorf("Unregister = %v, want [1]", ids)
+	}
+	id2, tok2 := enrollWorker(t, st)
+	other := &Client{BaseURL: c.BaseURL, Token: tok2, WorkerID: id2, HTTP: c.HTTP}
+	cl, err := other.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("other Claim: %v", err)
+	}
+	if cl.JobID != "job-drain" || cl.Attempt != 1 {
+		t.Fatalf("claim = %+v", cl)
+	}
+	w, err := st.GetWorker(context.Background(), c.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.State != job.WorkerCordoned {
+		t.Fatalf("state = %s, want cordoned", w.State)
+	}
+}
+
+func TestSweepDrainWaitsForRunning(t *testing.T) {
+	st, jobs, _, c, _, h := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-run-drain", 12))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.TransitionWorker(context.Background(), c.WorkerID, job.WorkerDraining); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	row, err := st.GetJob(context.Background(), cl.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobRunning {
+		t.Fatalf("state = %s, want running", row.State)
+	}
+	w, err := st.GetWorker(context.Background(), c.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.State != job.WorkerDraining {
+		t.Fatalf("worker = %s, want draining", w.State)
+	}
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep after succeed: %v", err)
+	}
+	w, err = st.GetWorker(context.Background(), c.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.State != job.WorkerCordoned {
+		t.Fatalf("state = %s, want cordoned", w.State)
+	}
+}

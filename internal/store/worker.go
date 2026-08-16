@@ -153,6 +153,46 @@ func (s *Store) SetWorkerState(ctx context.Context, id string, state job.WorkerS
 	return nil
 }
 
+// TransitionWorker applies a legal worker state change (FR-19).
+func (s *Store) TransitionWorker(ctx context.Context, id string, to job.WorkerState) error {
+	w, err := s.GetWorker(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := job.ValidateWorkerTransition(w.State, to); err != nil {
+		return err
+	}
+	return s.SetWorkerState(ctx, id, to)
+}
+
+// RemoveWorker marks the worker removed and drops its token hash (FR-19, FR-27).
+func (s *Store) RemoveWorker(ctx context.Context, id string) error {
+	w, err := s.GetWorker(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := job.ValidateWorkerTransition(w.State, job.WorkerRemoved); err != nil {
+		return err
+	}
+	gone, err := randomHex(32)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE workers SET state = ?, token_hash = ? WHERE id = ?`,
+		string(job.WorkerRemoved), hashToken(gone), id)
+	if err != nil {
+		return fmt.Errorf("store: remove worker: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: remove worker: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: worker %s not found", id)
+	}
+	return nil
+}
+
 const workerCols = `id, name, labels, capacity, state, burst, healthy, last_seen, token_hash, arch, version`
 
 func (s *Store) scanWorker(ctx context.Context, q string, arg any) (*job.Worker, error) {
@@ -229,14 +269,7 @@ func (s *Store) Heartbeat(ctx context.Context, id string, capacity int, healthy 
 
 // MarkLost sets a worker lost after missed heartbeats (FR-20).
 func (s *Store) MarkLost(ctx context.Context, id string) error {
-	w, err := s.GetWorker(ctx, id)
-	if err != nil {
-		return err
-	}
-	if err := job.ValidateWorkerTransition(w.State, job.WorkerLost); err != nil {
-		return err
-	}
-	return s.SetWorkerState(ctx, id, job.WorkerLost)
+	return s.TransitionWorker(ctx, id, job.WorkerLost)
 }
 
 // ListWorkers returns every enrolled worker.
