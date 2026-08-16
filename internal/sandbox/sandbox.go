@@ -10,13 +10,13 @@ import (
 // Spec is the per-job sandbox configuration.
 // Command is the process to run. Hardened is unused until M4.
 type Spec struct {
-	Image       string
-	Command     []string
-	CPU         float64
-	MemoryBytes int64
-	PIDs        int64
-	DiskBytes   int64
-	Hardened    bool
+	Image       string   `json:"image"`
+	Command     []string `json:"command,omitempty"`
+	CPU         float64  `json:"cpu,omitempty"`
+	MemoryBytes int64    `json:"memory_bytes,omitempty"`
+	PIDs        int64    `json:"pids,omitempty"`
+	DiskBytes   int64    `json:"disk_bytes,omitempty"`
+	Hardened    bool     `json:"hardened,omitempty"`
 }
 
 // Provider creates sandboxes. Create is the only source and always

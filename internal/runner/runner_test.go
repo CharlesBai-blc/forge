@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CharlesBai-blc/forge/internal/api"
 	"github.com/CharlesBai-blc/forge/internal/job"
 	"github.com/CharlesBai-blc/forge/internal/queue"
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
@@ -134,7 +136,7 @@ func testJob(id string, external int64) *job.Job {
 	}
 }
 
-func startRunner(t *testing.T, r *Runner) (context.CancelFunc, <-chan error) {
+func startRunner(t *testing.T, r *Runner) context.CancelFunc {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -147,10 +149,10 @@ func startRunner(t *testing.T, r *Runner) (context.CancelFunc, <-chan error) {
 			t.Error("Run did not return after cancel")
 		}
 	})
-	return cancel, done
+	return cancel
 }
 
-func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *queue.Queue, *Runner, *fakeSource) {
+func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *queue.Queue, *Runner, *fakeSource, string) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(context.Background(), filepath.Join(dir, "forge.db"))
@@ -160,17 +162,28 @@ func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *queue.Queue, 
 	t.Cleanup(func() { st.Close() })
 	src := &fakeSource{jit: &source.JITConfig{RunnerID: 1, Encoded: "jit-blob"}}
 	q := queue.New()
-	r := &Runner{
-		Queue:    q,
-		Store:    st,
-		Provider: p,
-		Source:   src,
-		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Image:    "alpine:3.20",
-		Command:  []string{"true"},
-		LogDir:   filepath.Join(dir, "logs"),
+	logDir := filepath.Join(dir, "logs")
+	h := &api.Handler{
+		Queue:     q,
+		Store:     st,
+		Source:    src,
+		Token:     "tok",
+		Image:     "alpine:3.20",
+		Command:   []string{"true"},
+		LogDir:    logDir,
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ClaimWait: 50 * time.Millisecond,
 	}
-	return st, q, r, src
+	mux := http.NewServeMux()
+	h.Register(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	r := &Runner{
+		Client:   &api.Client{BaseURL: srv.URL, Token: "tok", WorkerID: "w1", HTTP: srv.Client()},
+		Provider: p,
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	return st, q, r, src, logDir
 }
 
 func waitState(t *testing.T, st *store.Store, id string, want job.JobState) *job.Job {
@@ -190,7 +203,7 @@ func waitState(t *testing.T, st *store.Store, id string, want job.JobState) *job
 
 func TestRunSucceeded(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1"}}
-	st, q, r, src := openHarness(t, p)
+	st, q, r, src, _ := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-ok", 1)
@@ -221,7 +234,7 @@ func TestRunSucceeded(t *testing.T) {
 
 func TestRunNonzeroExitFailed(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1", exitCode: 7}}
-	st, q, r, _ := openHarness(t, p)
+	st, q, r, _, _ := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-fail", 2)
@@ -243,7 +256,7 @@ func TestRunNonzeroExitFailed(t *testing.T) {
 
 func TestCreateErrorFailsJob(t *testing.T) {
 	p := &fakeProvider{createErr: fmt.Errorf("no docker")}
-	st, q, r, src := openHarness(t, p)
+	st, q, r, src, _ := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-create", 3)
@@ -262,7 +275,7 @@ func TestCreateErrorFailsJob(t *testing.T) {
 
 func TestStartErrorDestroysAndFails(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1", startErr: fmt.Errorf("start failed")}}
-	st, q, r, src := openHarness(t, p)
+	st, q, r, src, _ := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-start", 4)
@@ -284,7 +297,7 @@ func TestStartErrorDestroysAndFails(t *testing.T) {
 
 func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1"}}
-	st, q, r, src := openHarness(t, p)
+	st, q, r, src, _ := openHarness(t, p)
 	src.registerErr = fmt.Errorf("github down")
 	startRunner(t, r)
 
@@ -318,7 +331,7 @@ func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 
 func TestRunWritesLogs(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1", logs: "hello-forge\n"}}
-	st, q, r, _ := openHarness(t, p)
+	st, q, r, _, logDir := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-logs", 6)
@@ -330,7 +343,7 @@ func TestRunWritesLogs(t *testing.T) {
 	}
 
 	waitState(t, st, j.ID, job.JobSucceeded)
-	b, err := os.ReadFile(filepath.Join(r.LogDir, "job-logs-0.log"))
+	b, err := os.ReadFile(filepath.Join(logDir, "job-logs-1.log"))
 	if err != nil {
 		t.Fatalf("read log: %v", err)
 	}
@@ -341,7 +354,7 @@ func TestRunWritesLogs(t *testing.T) {
 
 func TestRunCancelled(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1"}}
-	_, _, r, _ := openHarness(t, p)
-	cancel, _ := startRunner(t, r)
+	_, _, r, _, _ := openHarness(t, p)
+	cancel := startRunner(t, r)
 	cancel()
 }

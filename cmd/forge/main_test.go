@@ -21,7 +21,9 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
 
+	"github.com/CharlesBai-blc/forge/internal/api"
 	"github.com/CharlesBai-blc/forge/internal/job"
+	"github.com/CharlesBai-blc/forge/internal/runner"
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
 	dockersandbox "github.com/CharlesBai-blc/forge/internal/sandbox/docker"
 	"github.com/CharlesBai-blc/forge/internal/secret"
@@ -123,6 +125,10 @@ func TestValidateCredsRequired(t *testing.T) {
 		t.Fatal("expected error for missing webhook secret")
 	}
 	cfg = config{webhookSecret: "s", githubToken: "tok"}
+	if err := cfg.validateCreds(); err == nil {
+		t.Fatal("expected error for missing agent token")
+	}
+	cfg = config{webhookSecret: "s", githubToken: "tok", agentToken: "a"}
 	if err := cfg.validateCreds(); err != nil {
 		t.Fatalf("validateCreds: %v", err)
 	}
@@ -140,12 +146,12 @@ func TestResolveCredsPersistsEncrypted(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	const webhook, token = "super-secret-webhook", "ghp_plaintext_token"
-	got, err := resolveCreds(ctx, st, key, config{webhookSecret: webhook, githubToken: token})
+	const webhook, token, agent = "super-secret-webhook", "ghp_plaintext_token", "agent-secret"
+	got, err := resolveCreds(ctx, st, key, config{webhookSecret: webhook, githubToken: token, agentToken: agent})
 	if err != nil {
 		t.Fatalf("resolveCreds: %v", err)
 	}
-	if got.webhookSecret != webhook || got.githubToken != token {
+	if got.webhookSecret != webhook || got.githubToken != token || got.agentToken != agent {
 		t.Fatalf("resolved = %+v", got)
 	}
 
@@ -153,7 +159,7 @@ func TestResolveCredsPersistsEncrypted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read db: %v", err)
 	}
-	if bytes.Contains(raw, []byte(webhook)) || bytes.Contains(raw, []byte(token)) {
+	if bytes.Contains(raw, []byte(webhook)) || bytes.Contains(raw, []byte(token)) || bytes.Contains(raw, []byte(agent)) {
 		t.Fatal("plaintext credential found in database file")
 	}
 
@@ -171,7 +177,7 @@ func TestResolveCredsPersistsEncrypted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload creds: %v", err)
 	}
-	if loaded.webhookSecret != webhook || loaded.githubToken != token {
+	if loaded.webhookSecret != webhook || loaded.githubToken != token || loaded.agentToken != agent {
 		t.Fatalf("loaded = %+v", loaded)
 	}
 }
@@ -233,10 +239,11 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 		githubRepo:    "name",
 		image:         "alpine:3.20",
 		command:       []string{"true"},
+		agentToken:    "agent-tok",
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	appCtx, appCancel := context.WithCancel(context.Background())
-	a, err := newApp(appCtx, cfg, log, prov, src)
+	a, err := newApp(appCtx, cfg, log, src)
 	if err != nil {
 		appCancel()
 		t.Fatalf("newApp: %v", err)
@@ -246,10 +253,15 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 		a.Close()
 	})
 
-	go func() { _ = a.runner.Run(appCtx) }()
-
 	srv := httptest.NewServer(a.mux)
 	t.Cleanup(srv.Close)
+
+	agent := &runner.Runner{
+		Client:   &api.Client{BaseURL: srv.URL, Token: cfg.agentToken, WorkerID: "w1", HTTP: srv.Client()},
+		Provider: prov,
+		Log:      log,
+	}
+	go func() { _ = agent.Run(appCtx) }()
 
 	body := []byte(`{
 		"action": "queued",
@@ -275,7 +287,7 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 	if state != job.JobSucceeded {
 		t.Fatalf("state = %s, want succeeded (job %s)", state, jobID)
 	}
-	if _, err := os.Stat(filepath.Join(cfg.dataDir, "logs", jobID+"-0.log")); err != nil {
+	if _, err := os.Stat(filepath.Join(cfg.dataDir, "logs", jobID+"-1.log")); err != nil {
 		t.Fatalf("job log: %v", err)
 	}
 
