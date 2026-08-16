@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,7 +29,6 @@ type Handler struct {
 	Store     *store.Store
 	Stream    *stream.Stream
 	Source    source.RunnerSource
-	Token     string
 	Image     string
 	Command   []string
 	LogDir    string
@@ -44,6 +42,7 @@ type Handler struct {
 
 // Register attaches agent routes to mux.
 func (h *Handler) Register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /v1/agents/enroll", h.enroll)
 	mux.HandleFunc("GET /v1/agents/{id}/claim", h.claim)
 	mux.HandleFunc("POST /v1/jobs/{id}/attempts/{n}/status", h.status)
 	mux.HandleFunc("POST /v1/jobs/{id}/attempts/{n}/logs", h.logs)
@@ -56,22 +55,56 @@ func (h *Handler) log() *slog.Logger {
 	return h.Log
 }
 
-func (h *Handler) authorized(r *http.Request) bool {
-	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if !ok || h.Token == "" || len(got) != len(h.Token) {
-		return false
+func (h *Handler) enroll(w http.ResponseWriter, r *http.Request) {
+	var req EnrollRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(h.Token)) == 1
+	id, tok, err := h.Store.Enroll(r.Context(), req.Token, req.Name, req.Arch, req.Version)
+	if errors.Is(err, store.ErrEnrollmentUsed) {
+		http.Error(w, "conflict", http.StatusConflict)
+		return
+	}
+	if errors.Is(err, store.ErrEnrollmentExpired) || errors.Is(err, store.ErrEnrollmentInvalid) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		h.log().Error("enroll", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(EnrollResponse{WorkerID: id, Token: tok})
+}
+
+func (h *Handler) worker(r *http.Request) (*job.Worker, bool) {
+	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok || got == "" {
+		return nil, false
+	}
+	wk, err := h.Store.WorkerByToken(r.Context(), got)
+	if err != nil || wk.State == job.WorkerRemoved {
+		return nil, false
+	}
+	return wk, true
 }
 
 func (h *Handler) claim(w http.ResponseWriter, r *http.Request) {
-	if !h.authorized(r) {
+	wk, ok := h.worker(r)
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	workerID := r.PathValue("id")
-	if workerID == "" {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	if workerID == "" || workerID != wk.ID {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if wk.State != job.WorkerActive {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
@@ -137,7 +170,8 @@ func (h *Handler) claim(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
-	if !h.authorized(r) {
+	wk, ok := h.worker(r)
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -156,6 +190,10 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	j, err := h.Store.GetJob(r.Context(), jobID)
 	if err != nil {
 		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if j.WorkerID != wk.ID {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	if j.Attempt != n {
@@ -203,7 +241,8 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) logs(w http.ResponseWriter, r *http.Request) {
-	if !h.authorized(r) {
+	wk, ok := h.worker(r)
+	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -215,6 +254,15 @@ func (h *Handler) logs(w http.ResponseWriter, r *http.Request) {
 	n, err := strconv.Atoi(r.PathValue("n"))
 	if err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	j, err := h.Store.GetJob(r.Context(), jobID)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if j.WorkerID != wk.ID {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	if err := os.MkdirAll(h.LogDir, 0o755); err != nil {

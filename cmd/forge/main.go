@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -33,12 +34,18 @@ type config struct {
 	githubOrg     string
 	image         string
 	command       []string
-	agentToken    string
 	redis         string
 }
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	if len(os.Args) > 1 && os.Args[1] == "enroll-token" {
+		if err := runEnrollToken(os.Args[2:], os.Stdout); err != nil {
+			log.Error("forge", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 	cfg := parseFlags()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -58,7 +65,6 @@ func parseFlags() config {
 	githubOrg := flag.String("github-org", envOr("FORGE_GITHUB_ORG", ""), "GitHub org (org-level registration)")
 	image := flag.String("image", envOr("FORGE_JOB_IMAGE", ""), "sandbox image")
 	command := flag.String("command", envOr("FORGE_JOB_COMMAND", ""), "sandbox command; default is actions/runner JIT")
-	agentToken := flag.String("agent-token", os.Getenv("FORGE_AGENT_TOKEN"), "shared token for forge-agent")
 	redisAddr := flag.String("redis", envOr("FORGE_REDIS", "127.0.0.1:6379"), "redis address")
 	flag.Parse()
 	return config{
@@ -71,7 +77,6 @@ func parseFlags() config {
 		githubOrg:     *githubOrg,
 		image:         *image,
 		command:       strings.Fields(*command),
-		agentToken:    *agentToken,
 		redis:         *redisAddr,
 	}
 }
@@ -112,16 +117,12 @@ func (c config) validateCreds() error {
 	if c.githubToken == "" {
 		return fmt.Errorf("forge: -github-token is required")
 	}
-	if c.agentToken == "" {
-		return fmt.Errorf("forge: -agent-token is required")
-	}
 	return nil
 }
 
 const (
 	secretWebhook = "webhook_secret"
 	secretToken   = "github_token"
-	secretAgent   = "agent_token"
 )
 
 func resolveCreds(ctx context.Context, st *store.Store, key *[secret.KeySize]byte, cfg config) (config, error) {
@@ -130,9 +131,6 @@ func resolveCreds(ctx context.Context, st *store.Store, key *[secret.KeySize]byt
 		return cfg, err
 	}
 	if cfg.githubToken, err = resolveOne(ctx, st, key, secretToken, cfg.githubToken); err != nil {
-		return cfg, err
-	}
-	if cfg.agentToken, err = resolveOne(ctx, st, key, secretAgent, cfg.agentToken); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
@@ -230,7 +228,6 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.Runner
 		Stream:  jobs,
 		Store:   st,
 		Source:  src,
-		Token:   cfg.agentToken,
 		Image:   cfg.image,
 		Command: jobCommand(cfg.command),
 		LogDir:  filepath.Join(cfg.dataDir, "logs"),
@@ -270,5 +267,31 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 	if err == http.ErrServerClosed {
 		return nil
 	}
+	return err
+}
+
+func runEnrollToken(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("enroll-token", flag.ContinueOnError)
+	dataDir := fs.String("data-dir", envOr("FORGE_DATA_DIR", "./data"), "data directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dataDir == "" {
+		return fmt.Errorf("forge: -data-dir is required")
+	}
+	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+		return fmt.Errorf("forge: data dir: %w", err)
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(*dataDir, "forge.db"))
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	tok, err := st.IssueEnrollmentToken(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout, tok)
 	return err
 }

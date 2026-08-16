@@ -37,6 +37,33 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader, co
 	return c.http().Do(req)
 }
 
+// Enroll exchanges a one-time enrollment token for a worker ID and per-machine token (FR-3).
+func (c *Client) Enroll(ctx context.Context, token, name, arch, version string) (*EnrollResponse, error) {
+	b, err := json.Marshal(EnrollRequest{Token: token, Name: name, Arch: arch, Version: version})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v1/agents/enroll", bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("api: enroll: status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+	}
+	var out EnrollResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("api: enroll decode: %w", err)
+	}
+	return &out, nil
+}
+
 // Claim long-polls for work. Returns ErrNoJob on 204.
 func (c *Client) Claim(ctx context.Context) (*ClaimResponse, error) {
 	resp, err := c.do(ctx, http.MethodGet, "/v1/agents/"+c.WorkerID+"/claim", nil, "")

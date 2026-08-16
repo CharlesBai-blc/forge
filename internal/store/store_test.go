@@ -39,8 +39,8 @@ func TestOpenAppliesMigration(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil {
 		t.Fatalf("read schema_version: %v", err)
 	}
-	if version != 2 {
-		t.Errorf("schema_version = %d, want 2", version)
+	if version != 3 {
+		t.Errorf("schema_version = %d, want 3", version)
 	}
 }
 
