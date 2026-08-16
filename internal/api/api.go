@@ -1,7 +1,9 @@
-// Package api is the agent HTTP contract (tdd.md §4.6).
+// Package api is the agent HTTP contract (tdd.md §4.6) and dashboard (FR-24).
 package api
 
 import (
+	"time"
+
 	"github.com/CharlesBai-blc/forge/internal/job"
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
 )
@@ -40,4 +42,53 @@ type Heartbeat struct {
 	Capacity int      `json:"capacity"`
 	Running  []string `json:"running"`
 	Healthy  bool     `json:"healthy"`
+}
+
+// Dashboard is GET /v1/dashboard (FR-24).
+type Dashboard struct {
+	QueueDepth int               `json:"queue_depth"`
+	Jobs       []DashboardJob    `json:"jobs"`
+	Workers    []DashboardWorker `json:"workers"`
+}
+
+// DashboardJob is one row of the job list.
+type DashboardJob struct {
+	ID           string       `json:"id"`
+	Repo         string       `json:"repo"`
+	State        job.JobState `json:"state"`
+	Attempt      int          `json:"attempt"`
+	WorkerID     string       `json:"worker_id,omitempty"`
+	DeadLettered bool         `json:"dead_lettered"`
+	Reason       string       `json:"reason,omitempty"`
+	CreatedAt    time.Time    `json:"created_at"`
+	UpdatedAt    time.Time    `json:"updated_at"`
+	DurationMS   int64        `json:"duration_ms"`
+}
+
+// DashboardWorker is one row of the fleet list. Token hashes are omitted (FR-27).
+type DashboardWorker struct {
+	ID          string          `json:"id"`
+	Name        string          `json:"name"`
+	State       job.WorkerState `json:"state"`
+	Capacity    int             `json:"capacity"`
+	Running     int             `json:"running"`
+	Healthy     bool            `json:"healthy"`
+	LastSeen    time.Time       `json:"last_seen"`
+	Arch        string          `json:"arch"`
+	Utilization float64         `json:"utilization"`
+}
+
+// JobDetail is GET /v1/jobs/{id} (FR-9, FR-26).
+type JobDetail struct {
+	Job         DashboardJob          `json:"job"`
+	Transitions []DashboardTransition `json:"transitions"`
+}
+
+// DashboardTransition is one append-only history row.
+type DashboardTransition struct {
+	Attempt int          `json:"attempt"`
+	From    job.JobState `json:"from"`
+	To      job.JobState `json:"to"`
+	Reason  string       `json:"reason,omitempty"`
+	At      time.Time    `json:"at"`
 }

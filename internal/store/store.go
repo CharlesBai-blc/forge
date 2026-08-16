@@ -445,6 +445,71 @@ func (s *Store) JobsByWorker(ctx context.Context, workerID string, state job.Job
 	return out, nil
 }
 
+// ListJobs returns jobs newest first (FR-24).
+func (s *Store) ListJobs(ctx context.Context, limit int) ([]*job.Job, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobCols+` FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: list jobs: %w", err)
+	}
+	defer rows.Close()
+	out := []*job.Job{}
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list jobs: %w", err)
+	}
+	return out, nil
+}
+
+// CountQueued is queue depth (FR-24).
+func (s *Store) CountQueued(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE state = ?`, string(job.JobQueued)).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("store: count queued: %w", err)
+	}
+	return n, nil
+}
+
+// ListTransitions returns append-only history for a job (FR-9, FR-26).
+func (s *Store) ListTransitions(ctx context.Context, jobID string) ([]job.Transition, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT job_id, attempt, from_state, to_state, COALESCE(reason, ''), created_at
+		FROM transitions WHERE job_id = ? ORDER BY id ASC`, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("store: list transitions: %w", err)
+	}
+	defer rows.Close()
+	out := []job.Transition{}
+	for rows.Next() {
+		var (
+			tr job.Transition
+			at string
+		)
+		if err := rows.Scan(&tr.JobID, &tr.Attempt, &tr.From, &tr.To, &tr.Reason, &at); err != nil {
+			return nil, fmt.Errorf("store: scan transition: %w", err)
+		}
+		t, err := parseTime(at)
+		if err != nil {
+			return nil, fmt.Errorf("store: parse transition time: %w", err)
+		}
+		tr.At = t
+		out = append(out, tr)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list transitions: %w", err)
+	}
+	return out, nil
+}
+
 const jobCols = `id, source, external_id, repo, run_id, labels, state, attempt, COALESCE(worker_id, ''), dead_lettered, COALESCE(reason, ''), created_at, updated_at`
 
 func scanJob(row scanner) (*job.Job, error) {

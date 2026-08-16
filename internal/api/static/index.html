@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Forge</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 14px/1.45 system-ui, sans-serif; margin: 1.25rem; max-width: 72rem; }
+    h1 { font-size: 1.35rem; margin: 0 0 0.5rem; }
+    h2 { font-size: 1.05rem; margin: 1.25rem 0 0.4rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover, tbody tr.sel { background: color-mix(in srgb, currentColor 8%, transparent); }
+    pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    pre { white-space: pre-wrap; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); padding: 0.75rem; overflow: auto; max-height: 22rem; }
+    .muted { opacity: 0.7; }
+    .row { display: flex; gap: 2rem; flex-wrap: wrap; }
+    .row > * { flex: 1 1 18rem; }
+  </style>
+</head>
+<body>
+  <h1>Forge</h1>
+  <p>Queue depth: <strong id="queue">0</strong></p>
+
+  <h2>Bootstrap a worker</h2>
+  <p class="muted">Mint a one-time token on the control plane, then run the agent on the new machine (FR-3).</p>
+  <pre id="boot"></pre>
+
+  <div class="row">
+    <section>
+      <h2>Jobs</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Repo</th><th>State</th><th>Attempt</th><th>Duration</th></tr></thead>
+        <tbody id="jobs"></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>Workers</h2>
+      <table>
+        <thead><tr><th>Name</th><th>State</th><th>Healthy</th><th>Running</th><th>Util</th></tr></thead>
+        <tbody id="workers"></tbody>
+      </table>
+    </section>
+  </div>
+
+  <section>
+    <h2>Job <span id="job-id" class="muted">none selected</span></h2>
+    <p id="job-meta" class="muted"></p>
+    <h2>Transitions</h2>
+    <table>
+      <thead><tr><th>Attempt</th><th>From</th><th>To</th><th>Reason</th><th>At</th></tr></thead>
+      <tbody id="transitions"></tbody>
+    </table>
+    <h2>Logs</h2>
+    <pre id="logs"></pre>
+  </section>
+
+  <script>
+    const boot = document.getElementById('boot');
+    boot.textContent =
+      'forge enroll-token -data-dir ./data\n' +
+      'forge-agent -addr ' + location.origin + ' -enroll-token TOKEN -data-dir ./agent-data';
+
+    let selected = null;
+    let source = null;
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
+    }
+    function dur(ms) {
+      if (ms < 1000) return ms + 'ms';
+      const s = Math.round(ms / 1000);
+      if (s < 60) return s + 's';
+      return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+    }
+    function mark(s) { return s ? 'yes' : 'no'; }
+
+    async function refresh() {
+      const d = await (await fetch('/v1/dashboard')).json();
+      document.getElementById('queue').textContent = d.queue_depth;
+      document.getElementById('jobs').innerHTML = (d.jobs || []).map(j => {
+        const tag = j.dead_lettered ? ' failed (dead letter)' : '';
+        const cls = j.id === selected ? ' class="sel"' : '';
+        return '<tr data-id="' + esc(j.id) + '"' + cls + '>' +
+          '<td><code>' + esc(j.id) + '</code></td>' +
+          '<td>' + esc(j.repo) + '</td>' +
+          '<td>' + esc(j.state) + tag + '</td>' +
+          '<td>' + j.attempt + '</td>' +
+          '<td>' + dur(j.duration_ms) + '</td></tr>';
+      }).join('');
+      document.getElementById('workers').innerHTML = (d.workers || []).map(w =>
+        '<tr><td>' + esc(w.name) + '</td><td>' + esc(w.state) +
+        '</td><td>' + mark(w.healthy) + '</td><td>' + w.running + '/' + w.capacity +
+        '</td><td>' + Math.round((w.utilization || 0) * 100) + '%</td></tr>'
+      ).join('');
+    }
+
+    async function openJob(id) {
+      selected = id;
+      document.getElementById('job-id').textContent = id;
+      const d = await (await fetch('/v1/jobs/' + encodeURIComponent(id))).json();
+      const j = d.job;
+      document.getElementById('job-meta').textContent =
+        j.repo + '  ' + j.state + (j.dead_lettered ? '  dead-lettered' : '') +
+        (j.reason ? '  ' + j.reason : '') +
+        (j.worker_id ? '  worker ' + j.worker_id : '');
+      document.getElementById('transitions').innerHTML = (d.transitions || []).map(t =>
+        '<tr><td>' + t.attempt + '</td><td>' + esc(t.from || '') + '</td><td>' +
+        esc(t.to) + '</td><td>' + esc(t.reason || '') + '</td><td>' + esc(t.at) + '</td></tr>'
+      ).join('');
+      document.getElementById('logs').textContent = '';
+      if (source) source.close();
+      source = new EventSource('/v1/jobs/' + encodeURIComponent(id) + '/logs/stream');
+      source.onmessage = ev => {
+        try { document.getElementById('logs').textContent += JSON.parse(ev.data); }
+        catch { document.getElementById('logs').textContent += ev.data; }
+      };
+      source.addEventListener('end', () => { if (source) source.close(); });
+      refresh();
+    }
+
+    document.getElementById('jobs').addEventListener('click', e => {
+      const tr = e.target.closest('tr[data-id]');
+      if (tr) openJob(tr.dataset.id);
+    });
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
