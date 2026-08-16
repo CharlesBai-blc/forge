@@ -267,6 +267,27 @@ func (s *Store) Assign(ctx context.Context, jobID, workerID string) (*job.Job, e
 	return s.GetJob(ctx, jobID)
 }
 
+// QueuedIDs returns IDs of jobs still in queued (startup reconciler, tdd.md §6.2).
+func (s *Store) QueuedIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM jobs WHERE state = ?`, string(job.JobQueued))
+	if err != nil {
+		return nil, fmt.Errorf("store: queued ids: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("store: queued ids scan: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: queued ids: %w", err)
+	}
+	return ids, nil
+}
+
 // GetJob returns a job by ID.
 func (s *Store) GetJob(ctx context.Context, id string) (*job.Job, error) {
 	var (

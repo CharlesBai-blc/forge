@@ -16,10 +16,11 @@ import (
 
 	"github.com/CharlesBai-blc/forge/internal/api"
 	"github.com/CharlesBai-blc/forge/internal/job"
-	"github.com/CharlesBai-blc/forge/internal/queue"
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
 	"github.com/CharlesBai-blc/forge/internal/source"
 	"github.com/CharlesBai-blc/forge/internal/store"
+	"github.com/CharlesBai-blc/forge/internal/stream"
+	"github.com/alicebob/miniredis/v2"
 )
 
 type fakeSandbox struct {
@@ -152,7 +153,7 @@ func startRunner(t *testing.T, r *Runner) context.CancelFunc {
 	return cancel
 }
 
-func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *queue.Queue, *Runner, *fakeSource, string) {
+func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *stream.Stream, *Runner, *fakeSource, string) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(context.Background(), filepath.Join(dir, "forge.db"))
@@ -161,10 +162,15 @@ func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *queue.Queue, 
 	}
 	t.Cleanup(func() { st.Close() })
 	src := &fakeSource{jit: &source.JITConfig{RunnerID: 1, Encoded: "jit-blob"}}
-	q := queue.New()
+	mr := miniredis.RunT(t)
+	jobs, err := stream.Open(context.Background(), mr.Addr())
+	if err != nil {
+		t.Fatalf("stream.Open: %v", err)
+	}
+	t.Cleanup(func() { jobs.Close() })
 	logDir := filepath.Join(dir, "logs")
 	h := &api.Handler{
-		Queue:     q,
+		Stream:    jobs,
 		Store:     st,
 		Source:    src,
 		Token:     "tok",
@@ -183,7 +189,7 @@ func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *queue.Queue, 
 		Provider: p,
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	return st, q, r, src, logDir
+	return st, jobs, r, src, logDir
 }
 
 func waitState(t *testing.T, st *store.Store, id string, want job.JobState) *job.Job {
@@ -203,15 +209,15 @@ func waitState(t *testing.T, st *store.Store, id string, want job.JobState) *job
 
 func TestRunSucceeded(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1"}}
-	st, q, r, src, _ := openHarness(t, p)
+	st, jobs, r, src, _ := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-ok", 1)
 	if err := st.CreateJob(context.Background(), j); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	if err := q.Enqueue(j); err != nil {
-		t.Fatalf("Enqueue: %v", err)
+	if err := jobs.Add(context.Background(), j.ID); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
 
 	got := waitState(t, st, j.ID, job.JobSucceeded)
@@ -234,15 +240,15 @@ func TestRunSucceeded(t *testing.T) {
 
 func TestRunNonzeroExitFailed(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1", exitCode: 7}}
-	st, q, r, _, _ := openHarness(t, p)
+	st, jobs, r, _, _ := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-fail", 2)
 	if err := st.CreateJob(context.Background(), j); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	if err := q.Enqueue(j); err != nil {
-		t.Fatalf("Enqueue: %v", err)
+	if err := jobs.Add(context.Background(), j.ID); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
 
 	got := waitState(t, st, j.ID, job.JobFailed)
@@ -256,15 +262,15 @@ func TestRunNonzeroExitFailed(t *testing.T) {
 
 func TestCreateErrorFailsJob(t *testing.T) {
 	p := &fakeProvider{createErr: fmt.Errorf("no docker")}
-	st, q, r, src, _ := openHarness(t, p)
+	st, jobs, r, src, _ := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-create", 3)
 	if err := st.CreateJob(context.Background(), j); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	if err := q.Enqueue(j); err != nil {
-		t.Fatalf("Enqueue: %v", err)
+	if err := jobs.Add(context.Background(), j.ID); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
 
 	waitState(t, st, j.ID, job.JobFailed)
@@ -275,15 +281,15 @@ func TestCreateErrorFailsJob(t *testing.T) {
 
 func TestStartErrorDestroysAndFails(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1", startErr: fmt.Errorf("start failed")}}
-	st, q, r, src, _ := openHarness(t, p)
+	st, jobs, r, src, _ := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-start", 4)
 	if err := st.CreateJob(context.Background(), j); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	if err := q.Enqueue(j); err != nil {
-		t.Fatalf("Enqueue: %v", err)
+	if err := jobs.Add(context.Background(), j.ID); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
 
 	waitState(t, st, j.ID, job.JobFailed)
@@ -297,7 +303,7 @@ func TestStartErrorDestroysAndFails(t *testing.T) {
 
 func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1"}}
-	st, q, r, src, _ := openHarness(t, p)
+	st, jobs, r, src, _ := openHarness(t, p)
 	src.registerErr = fmt.Errorf("github down")
 	startRunner(t, r)
 
@@ -305,8 +311,8 @@ func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 	if err := st.CreateJob(context.Background(), j); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	if err := q.Enqueue(j); err != nil {
-		t.Fatalf("Enqueue: %v", err)
+	if err := jobs.Add(context.Background(), j.ID); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -331,15 +337,15 @@ func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 
 func TestRunWritesLogs(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1", logs: "hello-forge\n"}}
-	st, q, r, _, logDir := openHarness(t, p)
+	st, jobs, r, _, logDir := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-logs", 6)
 	if err := st.CreateJob(context.Background(), j); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	if err := q.Enqueue(j); err != nil {
-		t.Fatalf("Enqueue: %v", err)
+	if err := jobs.Add(context.Background(), j.ID); err != nil {
+		t.Fatalf("Add: %v", err)
 	}
 
 	waitState(t, st, j.ID, job.JobSucceeded)

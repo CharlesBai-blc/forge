@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
 
@@ -194,6 +195,64 @@ func TestRunRejectsMissingImage(t *testing.T) {
 	}
 }
 
+func TestStartupReconcilesQueued(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(dir, "forge.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	j := &job.Job{ID: "job-r", Source: "github", ExternalID: 99, Repo: "owner/name", RunID: 1, State: job.JobQueued}
+	if err := st.CreateJob(ctx, j); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	st.Close()
+
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/generate-jitconfig") {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"runner":{"id":1},"encoded_jit_config":"jit-blob"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(gh.Close)
+	src := &github.Source{
+		Secret:  testSecret,
+		Token:   "tok",
+		Owner:   "owner",
+		Repo:    "name",
+		BaseURL: gh.URL,
+		Client:  gh.Client(),
+	}
+	mr := miniredis.RunT(t)
+	cfg := config{
+		dataDir:       dir,
+		webhookSecret: testSecret,
+		githubToken:   "tok",
+		githubOwner:   "owner",
+		githubRepo:    "name",
+		image:         "alpine:3.20",
+		agentToken:    "agent-tok",
+		redis:         mr.Addr(),
+	}
+	a, err := newApp(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), src)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	t.Cleanup(func() { a.Close() })
+	srv := httptest.NewServer(a.mux)
+	t.Cleanup(srv.Close)
+	c := &api.Client{BaseURL: srv.URL, Token: cfg.agentToken, WorkerID: "w1", HTTP: srv.Client()}
+	cl, err := c.Claim(ctx)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if cl.JobID != "job-r" || cl.JIT != "jit-blob" {
+		t.Fatalf("claim = %+v", cl)
+	}
+}
+
 func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -241,6 +300,8 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 		command:       []string{"true"},
 		agentToken:    "agent-tok",
 	}
+	mr := miniredis.RunT(t)
+	cfg.redis = mr.Addr()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	appCtx, appCancel := context.WithCancel(context.Background())
 	a, err := newApp(appCtx, cfg, log, src)
