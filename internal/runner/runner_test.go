@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -27,6 +28,7 @@ type fakeSandbox struct {
 	started  bool
 	destroys int
 	jit      string
+	logs     string
 }
 
 func (s *fakeSandbox) ID() string { return s.id }
@@ -48,7 +50,7 @@ func (s *fakeSandbox) Wait(context.Context) (int, error) {
 }
 
 func (s *fakeSandbox) Logs(context.Context) (io.ReadCloser, error) {
-	return io.NopCloser(strings.NewReader("")), nil
+	return io.NopCloser(strings.NewReader(s.logs)), nil
 }
 
 func (s *fakeSandbox) Destroy(context.Context) error {
@@ -150,7 +152,8 @@ func startRunner(t *testing.T, r *Runner) (context.CancelFunc, <-chan error) {
 
 func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *queue.Queue, *Runner, *fakeSource) {
 	t.Helper()
-	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "forge.db"))
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), filepath.Join(dir, "forge.db"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
@@ -165,6 +168,7 @@ func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *queue.Queue, 
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Image:    "alpine:3.20",
 		Command:  []string{"true"},
+		LogDir:   filepath.Join(dir, "logs"),
 	}
 	return st, q, r, src
 }
@@ -310,6 +314,29 @@ func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("RegisterJIT not called")
+}
+
+func TestRunWritesLogs(t *testing.T) {
+	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1", logs: "hello-forge\n"}}
+	st, q, r, _ := openHarness(t, p)
+	startRunner(t, r)
+
+	j := testJob("job-logs", 6)
+	if err := st.CreateJob(context.Background(), j); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if err := q.Enqueue(j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	waitState(t, st, j.ID, job.JobSucceeded)
+	b, err := os.ReadFile(filepath.Join(r.LogDir, "job-logs-0.log"))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if string(b) != "hello-forge\n" {
+		t.Errorf("log = %q, want hello-forge\\n", b)
+	}
 }
 
 func TestRunCancelled(t *testing.T) {

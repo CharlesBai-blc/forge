@@ -125,6 +125,9 @@ func TestLogs(t *testing.T) {
 	if err := sb.Start(ctx, ""); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	if _, err := sb.Wait(ctx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
 
 	rc, err := sb.Logs(ctx)
 	if err != nil {
@@ -132,21 +135,12 @@ func TestLogs(t *testing.T) {
 	}
 	defer rc.Close()
 
-	waitc := make(chan error, 1)
-	go func() {
-		_, err := sb.Wait(ctx)
-		waitc <- err
-	}()
-
 	b, err := io.ReadAll(rc)
 	if err != nil {
 		t.Fatalf("read logs: %v", err)
 	}
 	if !bytes.Contains(b, []byte("hello-forge")) {
 		t.Errorf("logs = %q, want hello-forge", b)
-	}
-	if err := <-waitc; err != nil {
-		t.Fatalf("Wait: %v", err)
 	}
 }
 
