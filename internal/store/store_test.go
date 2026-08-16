@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/CharlesBai-blc/forge/internal/job"
@@ -185,6 +186,53 @@ func TestTransitionUnknownJob(t *testing.T) {
 	s := openTestStore(t)
 	if err := s.Transition(context.Background(), "missing", job.JobAssigned, ""); err == nil {
 		t.Fatal("expected error for unknown job")
+	}
+}
+
+func TestConcurrentGetAndTransition(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateJob(ctx, testJob("job-1")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+
+	stop := make(chan struct{})
+	errc := make(chan error, 8)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := s.GetJob(ctx, "job-1"); err != nil {
+					errc <- err
+					return
+				}
+			}
+		}()
+	}
+
+	if err := s.Transition(ctx, "job-1", job.JobAssigned, ""); err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+	close(errc)
+	for err := range errc {
+		t.Fatalf("GetJob: %v", err)
+	}
+
+	got, err := s.GetJob(ctx, "job-1")
+	if err != nil {
+		t.Fatalf("GetJob: %v", err)
+	}
+	if got.State != job.JobAssigned {
+		t.Errorf("State = %s, want %s", got.State, job.JobAssigned)
 	}
 }
 

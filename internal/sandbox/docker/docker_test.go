@@ -63,10 +63,10 @@ func TestStartTwiceErrors(t *testing.T) {
 	p := dockerProvider(t)
 	sb := createSandbox(t, p, testSpec("true"))
 	ctx := context.Background()
-	if err := sb.Start(ctx); err != nil {
+	if err := sb.Start(ctx, ""); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := sb.Start(ctx); err == nil {
+	if err := sb.Start(ctx, ""); err == nil {
 		t.Fatal("expected error on second Start")
 	}
 }
@@ -105,7 +105,7 @@ func TestWaitExitCode(t *testing.T) {
 	sb := createSandbox(t, p, testSpec("sh", "-c", "exit 7"))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := sb.Start(ctx); err != nil {
+	if err := sb.Start(ctx, ""); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	code, err := sb.Wait(ctx)
@@ -122,7 +122,7 @@ func TestLogs(t *testing.T) {
 	sb := createSandbox(t, p, testSpec("echo", "hello-forge"))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := sb.Start(ctx); err != nil {
+	if err := sb.Start(ctx, ""); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -147,5 +147,35 @@ func TestLogs(t *testing.T) {
 	}
 	if err := <-waitc; err != nil {
 		t.Fatalf("Wait: %v", err)
+	}
+}
+
+func TestStartInjectsJIT(t *testing.T) {
+	p := dockerProvider(t)
+	sb := createSandbox(t, p, testSpec("cat", "/"+jitPath))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	const blob = "jit-encoded-blob"
+	if err := sb.Start(ctx, blob); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	code, err := sb.Wait(ctx)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	rc, err := sb.Logs(ctx)
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read logs: %v", err)
+	}
+	if !bytes.Contains(b, []byte(blob)) {
+		t.Errorf("logs = %q, want %q", b, blob)
 	}
 }
