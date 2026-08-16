@@ -1,0 +1,8 @@
+# Local control-plane data directory (default -data-dir)
+/data/
+
+# Built binaries
+/forge
+/forge-agent
+
+.DS_Store
