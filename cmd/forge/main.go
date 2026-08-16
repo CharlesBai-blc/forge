@@ -14,11 +14,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/CharlesBai-blc/forge/internal/api"
 	"github.com/CharlesBai-blc/forge/internal/job"
 	"github.com/CharlesBai-blc/forge/internal/queue"
-	"github.com/CharlesBai-blc/forge/internal/runner"
-	"github.com/CharlesBai-blc/forge/internal/sandbox"
-	dockersandbox "github.com/CharlesBai-blc/forge/internal/sandbox/docker"
 	"github.com/CharlesBai-blc/forge/internal/secret"
 	"github.com/CharlesBai-blc/forge/internal/source"
 	"github.com/CharlesBai-blc/forge/internal/source/github"
@@ -35,6 +33,7 @@ type config struct {
 	githubOrg     string
 	image         string
 	command       []string
+	agentToken    string
 }
 
 func main() {
@@ -58,6 +57,7 @@ func parseFlags() config {
 	githubOrg := flag.String("github-org", envOr("FORGE_GITHUB_ORG", ""), "GitHub org (org-level registration)")
 	image := flag.String("image", envOr("FORGE_JOB_IMAGE", ""), "sandbox image")
 	command := flag.String("command", envOr("FORGE_JOB_COMMAND", ""), "sandbox command; default is actions/runner JIT")
+	agentToken := flag.String("agent-token", os.Getenv("FORGE_AGENT_TOKEN"), "shared token for forge-agent")
 	flag.Parse()
 	return config{
 		addr:          *addr,
@@ -69,6 +69,7 @@ func parseFlags() config {
 		githubOrg:     *githubOrg,
 		image:         *image,
 		command:       strings.Fields(*command),
+		agentToken:    *agentToken,
 	}
 }
 
@@ -108,12 +109,16 @@ func (c config) validateCreds() error {
 	if c.githubToken == "" {
 		return fmt.Errorf("forge: -github-token is required")
 	}
+	if c.agentToken == "" {
+		return fmt.Errorf("forge: -agent-token is required")
+	}
 	return nil
 }
 
 const (
 	secretWebhook = "webhook_secret"
 	secretToken   = "github_token"
+	secretAgent   = "agent_token"
 )
 
 func resolveCreds(ctx context.Context, st *store.Store, key *[secret.KeySize]byte, cfg config) (config, error) {
@@ -122,6 +127,9 @@ func resolveCreds(ctx context.Context, st *store.Store, key *[secret.KeySize]byt
 		return cfg, err
 	}
 	if cfg.githubToken, err = resolveOne(ctx, st, key, secretToken, cfg.githubToken); err != nil {
+		return cfg, err
+	}
+	if cfg.agentToken, err = resolveOne(ctx, st, key, secretAgent, cfg.agentToken); err != nil {
 		return cfg, err
 	}
 	return cfg, nil
@@ -153,13 +161,11 @@ func resolveOne(ctx context.Context, st *store.Store, key *[secret.KeySize]byte,
 }
 
 type app struct {
-	store    *store.Store
-	runner   *runner.Runner
-	mux      *http.ServeMux
-	provider sandbox.Provider
+	store *store.Store
+	mux   *http.ServeMux
 }
 
-func newApp(ctx context.Context, cfg config, log *slog.Logger, provider sandbox.Provider, src source.RunnerSource) (*app, error) {
+func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.RunnerSource) (*app, error) {
 	if err := os.MkdirAll(cfg.dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("forge: data dir: %w", err)
 	}
@@ -190,16 +196,6 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, provider sandbox.
 		}
 	}
 	q := queue.New()
-	r := &runner.Runner{
-		Queue:    q,
-		Store:    st,
-		Provider: provider,
-		Source:   src,
-		Log:      log,
-		Image:    cfg.image,
-		Command:  jobCommand(cfg.command),
-		LogDir:   filepath.Join(cfg.dataDir, "logs"),
-	}
 	h := &webhookHandler{
 		src: src,
 		onJob: func(j *job.Job) error {
@@ -211,13 +207,21 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, provider sandbox.
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/webhook/github", h)
-	return &app{store: st, runner: r, mux: mux, provider: provider}, nil
+	apiH := &api.Handler{
+		Queue:   q,
+		Store:   st,
+		Source:  src,
+		Token:   cfg.agentToken,
+		Image:   cfg.image,
+		Command: jobCommand(cfg.command),
+		LogDir:  filepath.Join(cfg.dataDir, "logs"),
+		Log:     log,
+	}
+	apiH.Register(mux)
+	return &app{store: st, mux: mux}, nil
 }
 
 func (a *app) Close() error {
-	if c, ok := a.provider.(interface{ Close() error }); ok {
-		_ = c.Close()
-	}
 	return a.store.Close()
 }
 
@@ -225,22 +229,11 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 	if err := cfg.validate(); err != nil {
 		return err
 	}
-	p, err := dockersandbox.NewProvider()
+	a, err := newApp(ctx, cfg, log, nil)
 	if err != nil {
-		return err
-	}
-	a, err := newApp(ctx, cfg, log, p, nil)
-	if err != nil {
-		p.Close()
 		return err
 	}
 	defer a.Close()
-
-	go func() {
-		if err := a.runner.Run(ctx); err != nil && ctx.Err() == nil {
-			log.Error("runner", "err", err)
-		}
-	}()
 
 	srv := &http.Server{Addr: cfg.addr, Handler: a.mux}
 	go func() {

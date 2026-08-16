@@ -1,32 +1,23 @@
-// Package runner is the in-process claim loop: queue, JIT, sandbox, store.
+// Package runner is forge-agent's claim loop: HTTP claim, sandbox, status.
 package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"os"
-	"path/filepath"
+	"time"
 
+	"github.com/CharlesBai-blc/forge/internal/api"
 	"github.com/CharlesBai-blc/forge/internal/job"
-	"github.com/CharlesBai-blc/forge/internal/queue"
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
-	"github.com/CharlesBai-blc/forge/internal/source"
-	"github.com/CharlesBai-blc/forge/internal/store"
 )
 
-// Runner claims jobs and runs each to a terminal state in a fresh sandbox.
+// Runner claims jobs from the control plane and runs each in a fresh sandbox.
 type Runner struct {
-	Queue    *queue.Queue
-	Store    *store.Store
+	Client   *api.Client
 	Provider sandbox.Provider
-	Source   source.RunnerSource
 	Log      *slog.Logger
-
-	Image   string
-	Command []string
-	LogDir  string
 }
 
 // Run claims jobs until ctx is cancelled.
@@ -35,107 +26,73 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.Log = slog.Default()
 	}
 	for {
-		j, err := r.Queue.Claim(ctx)
+		cl, err := r.Client.Claim(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			if errors.Is(err, api.ErrNoJob) {
+				continue
+			}
 			r.Log.Error("claim", "err", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Second):
+			}
 			continue
 		}
-		r.runOne(ctx, j)
+		r.runOne(ctx, cl)
 	}
 }
 
-// runOne runs one job to a terminal state. Destroy runs on every exit path (FR-13).
-// JIT is registered at claim time (FR-4, FR-5). Unconsumed credentials are unregistered.
-func (r *Runner) runOne(ctx context.Context, j *job.Job) {
-	storeCtx := context.Background()
-
-	jit, err := r.Source.RegisterJIT(ctx, j)
-	if err != nil {
-		r.Log.Error("register jit", "job", j.ID, "err", err)
-		if err := r.Queue.Enqueue(j); err != nil {
-			r.Log.Error("requeue", "job", j.ID, "err", err)
-			r.transition(storeCtx, j.ID, job.JobFailed, "register_jit: "+err.Error())
+// runOne runs one claimed job. Destroy runs on every exit path (FR-13).
+func (r *Runner) runOne(ctx context.Context, cl *api.ClaimResponse) {
+	report := func(rep api.StatusReport) {
+		if err := r.Client.Status(context.Background(), cl.JobID, cl.Attempt, rep); err != nil {
+			r.Log.Error("status", "job", cl.JobID, "err", err)
 		}
-		return
 	}
 
-	consumed := false
-	defer func() {
-		if consumed {
-			return
-		}
-		if err := r.Source.Unregister(context.Background(), jit.RunnerID); err != nil {
-			r.Log.Error("unregister", "job", j.ID, "runner", jit.RunnerID, "err", err)
-		}
-	}()
-
-	spec := sandbox.Spec{Image: r.Image, Command: r.Command}
-	sb, err := r.Provider.Create(ctx, spec)
+	sb, err := r.Provider.Create(ctx, cl.Spec)
 	if err != nil {
-		r.transition(storeCtx, j.ID, job.JobFailed, "sandbox_error: "+err.Error())
+		report(api.StatusReport{State: job.JobFailed, Reason: "sandbox_error: " + err.Error()})
 		return
 	}
 	defer func() {
 		if err := sb.Destroy(context.Background()); err != nil {
-			r.Log.Error("destroy", "job", j.ID, "err", err)
+			r.Log.Error("destroy", "job", cl.JobID, "err", err)
 		}
 	}()
 
-	r.transition(storeCtx, j.ID, job.JobAssigned, "")
-
-	if err := sb.Start(ctx, jit.Encoded); err != nil {
-		r.transition(storeCtx, j.ID, job.JobLost, "start: "+err.Error())
-		r.transition(storeCtx, j.ID, job.JobFailed, "start: "+err.Error())
+	if err := sb.Start(ctx, cl.JIT); err != nil {
+		report(api.StatusReport{State: job.JobFailed, Reason: "start: " + err.Error()})
 		return
 	}
-	consumed = true
+	report(api.StatusReport{State: job.JobRunning})
 
-	r.transition(storeCtx, j.ID, job.JobRunning, "")
-
-	code, err := sb.Wait(ctx)
-	r.writeLogs(context.Background(), sb, j)
-	if err != nil {
-		r.transition(storeCtx, j.ID, job.JobFailed, err.Error())
+	code, waitErr := sb.Wait(ctx)
+	r.uploadLogs(context.Background(), sb, cl)
+	if waitErr != nil {
+		report(api.StatusReport{State: job.JobFailed, Reason: waitErr.Error()})
 		return
 	}
 	if code == 0 {
-		r.transition(storeCtx, j.ID, job.JobSucceeded, "")
+		report(api.StatusReport{State: job.JobSucceeded})
 		return
 	}
-	r.transition(storeCtx, j.ID, job.JobFailed, fmt.Sprintf("exit %d", code))
+	c := code
+	report(api.StatusReport{State: job.JobFailed, ExitCode: &c, Reason: fmt.Sprintf("exit %d", code)})
 }
 
-func (r *Runner) writeLogs(ctx context.Context, sb sandbox.Sandbox, j *job.Job) {
-	if r.LogDir == "" {
-		return
-	}
-	if err := os.MkdirAll(r.LogDir, 0o755); err != nil {
-		r.Log.Error("logs dir", "job", j.ID, "err", err)
-		return
-	}
+func (r *Runner) uploadLogs(ctx context.Context, sb sandbox.Sandbox, cl *api.ClaimResponse) {
 	rc, err := sb.Logs(ctx)
 	if err != nil {
-		r.Log.Error("logs", "job", j.ID, "err", err)
+		r.Log.Error("logs", "job", cl.JobID, "err", err)
 		return
 	}
 	defer rc.Close()
-	path := filepath.Join(r.LogDir, fmt.Sprintf("%s-%d.log", j.ID, j.Attempt))
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		r.Log.Error("logs file", "job", j.ID, "err", err)
-		return
-	}
-	defer f.Close()
-	if _, err := io.Copy(f, rc); err != nil {
-		r.Log.Error("logs copy", "job", j.ID, "err", err)
-	}
-}
-
-func (r *Runner) transition(ctx context.Context, id string, to job.JobState, reason string) {
-	if err := r.Store.Transition(ctx, id, to, reason); err != nil {
-		r.Log.Error("transition", "job", id, "to", to, "err", err)
+	if err := r.Client.Logs(ctx, cl.JobID, cl.Attempt, rc); err != nil {
+		r.Log.Error("logs upload", "job", cl.JobID, "err", err)
 	}
 }

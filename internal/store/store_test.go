@@ -182,6 +182,31 @@ func TestTransitionRejectsIllegalEdge(t *testing.T) {
 	}
 }
 
+func TestAssignIncrementsAttemptAndSetsWorker(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateJob(ctx, testJob("job-1")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	got, err := s.Assign(ctx, "job-1", "worker-1")
+	if err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	if got.State != job.JobAssigned {
+		t.Errorf("State = %s, want assigned", got.State)
+	}
+	if got.Attempt != 1 {
+		t.Errorf("Attempt = %d, want 1", got.Attempt)
+	}
+	if got.WorkerID != "worker-1" {
+		t.Errorf("WorkerID = %q, want worker-1", got.WorkerID)
+	}
+
+	if _, err := s.Assign(ctx, "job-1", "worker-2"); err == nil {
+		t.Fatal("expected error assigning a non-queued job")
+	}
+}
+
 func TestTransitionUnknownJob(t *testing.T) {
 	s := openTestStore(t)
 	if err := s.Transition(context.Background(), "missing", job.JobAssigned, ""); err == nil {

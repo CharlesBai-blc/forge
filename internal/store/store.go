@@ -222,6 +222,51 @@ func (s *Store) Transition(ctx context.Context, jobID string, to job.JobState, r
 	return tx.Commit()
 }
 
+// Assign is claim delivery: increment attempt, set worker, queued -> assigned.
+func (s *Store) Assign(ctx context.Context, jobID, workerID string) (*job.Job, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("store: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		from    job.JobState
+		attempt int
+	)
+	err = tx.QueryRowContext(ctx, `SELECT state, attempt FROM jobs WHERE id = ?`, jobID).Scan(&from, &attempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("store: job %s not found", jobID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: select job: %w", err)
+	}
+	if from != job.JobQueued {
+		return nil, fmt.Errorf("store: assign %s: state %s, want %s", jobID, from, job.JobQueued)
+	}
+
+	attempt++
+	now := formatTime(time.Now().UTC())
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state = ?, attempt = ?, worker_id = NULLIF(?, ''), updated_at = ?
+		WHERE id = ?`,
+		string(job.JobAssigned), attempt, workerID, now, jobID,
+	); err != nil {
+		return nil, fmt.Errorf("store: assign update: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO transitions (job_id, attempt, from_state, to_state, reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		jobID, attempt, string(job.JobQueued), string(job.JobAssigned), "", now,
+	); err != nil {
+		return nil, fmt.Errorf("store: assign transition: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.GetJob(ctx, jobID)
+}
+
 // GetJob returns a job by ID.
 func (s *Store) GetJob(ctx context.Context, id string) (*job.Job, error) {
 	var (
