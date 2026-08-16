@@ -167,15 +167,7 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 	if len(ids) == 0 {
 		t.Fatal("no sandbox created")
 	}
-	for _, id := range ids {
-		_, err := cli.ContainerInspect(context.Background(), id)
-		if err == nil {
-			t.Fatalf("container %s still present", id)
-		}
-		if !errdefs.IsNotFound(err) {
-			t.Fatalf("inspect %s: %v", id, err)
-		}
-	}
+	waitContainersGone(t, cli, ids)
 }
 
 func waitJobState(t *testing.T, dataDir string, want ...job.JobState) (job.JobState, string) {
@@ -202,4 +194,27 @@ func waitJobState(t *testing.T, dataDir string, want ...job.JobState) (job.JobSt
 	}
 	t.Fatalf("job did not reach %v", want)
 	return "", ""
+}
+
+func waitContainersGone(t *testing.T, cli *client.Client, ids []string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		allGone := true
+		for _, id := range ids {
+			_, err := cli.ContainerInspect(context.Background(), id)
+			if err == nil {
+				allGone = false
+				break
+			}
+			if !errdefs.IsNotFound(err) {
+				t.Fatalf("inspect %s: %v", id, err)
+			}
+		}
+		if allGone {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("containers still present: %v", ids)
 }
