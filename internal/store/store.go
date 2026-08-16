@@ -37,6 +37,9 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: ping %s: %w", path, err)
 	}
+	// SQLite allows one writer. Without this, database/sql opens
+	// extra connections and concurrent GetJob/Transition hit SQLITE_BUSY.
+	db.SetMaxOpenConns(1)
 	if err := migrate(ctx, db); err != nil {
 		db.Close()
 		return nil, err
