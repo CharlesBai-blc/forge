@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/CharlesBai-blc/forge/internal/api"
@@ -13,11 +14,21 @@ import (
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
 )
 
+const (
+	defaultHeartbeat = 10 * time.Second
+	defaultCapacity  = 1
+)
+
 // Runner claims jobs from the control plane and runs each in a fresh sandbox.
 type Runner struct {
-	Client   *api.Client
-	Provider sandbox.Provider
-	Log      *slog.Logger
+	Client         *api.Client
+	Provider       sandbox.Provider
+	Log            *slog.Logger
+	HeartbeatEvery time.Duration
+
+	mu      sync.Mutex
+	current string
+	healthy bool
 }
 
 // Run claims jobs until ctx is cancelled.
@@ -25,7 +36,17 @@ func (r *Runner) Run(ctx context.Context) error {
 	if r.Log == nil {
 		r.Log = slog.Default()
 	}
+	r.setHealthy(true)
+	go r.heartbeatLoop(ctx)
 	for {
+		if !r.isHealthy() {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(r.heartbeatEvery()):
+			}
+			continue
+		}
 		cl, err := r.Client.Claim(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -42,8 +63,75 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		r.setCurrent(cl.JobID)
 		r.runOne(ctx, cl)
+		r.setCurrent("")
 	}
+}
+
+func (r *Runner) heartbeatEvery() time.Duration {
+	if r.HeartbeatEvery > 0 {
+		return r.HeartbeatEvery
+	}
+	return defaultHeartbeat
+}
+
+func (r *Runner) heartbeatLoop(ctx context.Context) {
+	r.sendHeartbeat(ctx)
+	t := time.NewTicker(r.heartbeatEvery())
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			r.sendHeartbeat(ctx)
+		}
+	}
+}
+
+func (r *Runner) sendHeartbeat(ctx context.Context) {
+	ok := r.dockerHealthy(ctx)
+	r.setHealthy(ok)
+	hb := api.Heartbeat{Capacity: defaultCapacity, Healthy: ok}
+	if id := r.currentJob(); id != "" {
+		hb.Running = []string{id}
+	}
+	if err := r.Client.Heartbeat(ctx, hb); err != nil && ctx.Err() == nil {
+		r.Log.Error("heartbeat", "err", err)
+	}
+}
+
+func (r *Runner) dockerHealthy(ctx context.Context) bool {
+	p, ok := r.Provider.(interface{ Ping(context.Context) error })
+	if !ok {
+		return true
+	}
+	return p.Ping(ctx) == nil
+}
+
+func (r *Runner) setHealthy(v bool) {
+	r.mu.Lock()
+	r.healthy = v
+	r.mu.Unlock()
+}
+
+func (r *Runner) isHealthy() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.healthy
+}
+
+func (r *Runner) setCurrent(id string) {
+	r.mu.Lock()
+	r.current = id
+	r.mu.Unlock()
+}
+
+func (r *Runner) currentJob() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.current
 }
 
 // runOne runs one claimed job. Destroy runs on every exit path (FR-13).

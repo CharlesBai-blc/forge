@@ -267,6 +267,84 @@ func (s *Store) Assign(ctx context.Context, jobID, workerID string) (*job.Job, e
 	return s.GetJob(ctx, jobID)
 }
 
+// Requeue moves a lost job back to queued and clears the worker (FR-11).
+func (s *Store) Requeue(ctx context.Context, jobID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin requeue: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		from    job.JobState
+		attempt int
+	)
+	err = tx.QueryRowContext(ctx, `SELECT state, attempt FROM jobs WHERE id = ?`, jobID).Scan(&from, &attempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("store: job %s not found", jobID)
+	}
+	if err != nil {
+		return fmt.Errorf("store: select job: %w", err)
+	}
+	if err := job.ValidateTransition(from, job.JobQueued); err != nil {
+		return err
+	}
+	now := formatTime(time.Now().UTC())
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state = ?, worker_id = NULL, reason = ?, updated_at = ? WHERE id = ?`,
+		string(job.JobQueued), "", now, jobID,
+	); err != nil {
+		return fmt.Errorf("store: requeue update: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO transitions (job_id, attempt, from_state, to_state, reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		jobID, attempt, string(from), string(job.JobQueued), "", now,
+	); err != nil {
+		return fmt.Errorf("store: requeue transition: %w", err)
+	}
+	return tx.Commit()
+}
+
+// DeadLetter marks a lost job failed with DeadLettered set (FR-12).
+func (s *Store) DeadLetter(ctx context.Context, jobID, reason string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin dead letter: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		from    job.JobState
+		attempt int
+	)
+	err = tx.QueryRowContext(ctx, `SELECT state, attempt FROM jobs WHERE id = ?`, jobID).Scan(&from, &attempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("store: job %s not found", jobID)
+	}
+	if err != nil {
+		return fmt.Errorf("store: select job: %w", err)
+	}
+	if err := job.ValidateTransition(from, job.JobFailed); err != nil {
+		return err
+	}
+	now := formatTime(time.Now().UTC())
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state = ?, dead_lettered = 1, reason = ?, updated_at = ? WHERE id = ?`,
+		string(job.JobFailed), reason, now, jobID,
+	); err != nil {
+		return fmt.Errorf("store: dead letter update: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO transitions (job_id, attempt, from_state, to_state, reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		jobID, attempt, string(from), string(job.JobFailed), reason, now,
+	); err != nil {
+		return fmt.Errorf("store: dead letter transition: %w", err)
+	}
+	return tx.Commit()
+}
+
 // QueuedIDs returns IDs of jobs still in queued (startup reconciler, tdd.md §6.2).
 func (s *Store) QueuedIDs(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM jobs WHERE state = ?`, string(job.JobQueued))

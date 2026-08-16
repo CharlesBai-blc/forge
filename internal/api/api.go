@@ -34,3 +34,10 @@ type StatusReport struct {
 	ExitCode *int         `json:"exit_code,omitempty"`
 	Reason   string       `json:"reason,omitempty"`
 }
+
+// Heartbeat is the agent's liveness report (FR-18, FR-20).
+type Heartbeat struct {
+	Capacity int      `json:"capacity"`
+	Running  []string `json:"running"`
+	Healthy  bool     `json:"healthy"`
+}

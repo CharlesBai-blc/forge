@@ -156,6 +156,14 @@ func (s *Store) SetWorkerState(ctx context.Context, id string, state job.WorkerS
 const workerCols = `id, name, labels, capacity, state, burst, healthy, last_seen, token_hash, arch, version`
 
 func (s *Store) scanWorker(ctx context.Context, q string, arg any) (*job.Worker, error) {
+	return scanWorkerRow(s.db.QueryRowContext(ctx, q, arg))
+}
+
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+func scanWorkerRow(row scanner) (*job.Worker, error) {
 	var (
 		w        job.Worker
 		labels   string
@@ -163,7 +171,7 @@ func (s *Store) scanWorker(ctx context.Context, q string, arg any) (*job.Worker,
 		healthy  int
 		lastSeen string
 	)
-	err := s.db.QueryRowContext(ctx, q, arg).Scan(
+	err := row.Scan(
 		&w.ID, &w.Name, &labels, &w.Capacity, &w.State, &burst, &healthy, &lastSeen, &w.TokenHash, &w.Arch, &w.Version,
 	)
 	if err != nil {
@@ -191,4 +199,79 @@ func randomHex(n int) (string, error) {
 		return "", fmt.Errorf("store: random: %w", err)
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// Heartbeat records liveness. A lost worker becomes active (FR-20).
+func (s *Store) Heartbeat(ctx context.Context, id string, capacity int, healthy bool) error {
+	w, err := s.GetWorker(ctx, id)
+	if err != nil {
+		return err
+	}
+	if w.State == job.WorkerRemoved {
+		return fmt.Errorf("store: worker %s is removed", id)
+	}
+	state := w.State
+	if state == job.WorkerLost {
+		if err := job.ValidateWorkerTransition(state, job.WorkerActive); err != nil {
+			return err
+		}
+		state = job.WorkerActive
+	}
+	now := formatTime(time.Now().UTC())
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE workers SET last_seen = ?, capacity = ?, healthy = ?, state = ? WHERE id = ?`,
+		now, capacity, boolToInt(healthy), string(state), id)
+	if err != nil {
+		return fmt.Errorf("store: heartbeat: %w", err)
+	}
+	return nil
+}
+
+// MarkLost sets a worker lost after missed heartbeats (FR-20).
+func (s *Store) MarkLost(ctx context.Context, id string) error {
+	w, err := s.GetWorker(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := job.ValidateWorkerTransition(w.State, job.WorkerLost); err != nil {
+		return err
+	}
+	return s.SetWorkerState(ctx, id, job.WorkerLost)
+}
+
+// ListWorkers returns every enrolled worker.
+func (s *Store) ListWorkers(ctx context.Context) ([]*job.Worker, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+workerCols+` FROM workers`)
+	if err != nil {
+		return nil, fmt.Errorf("store: list workers: %w", err)
+	}
+	defer rows.Close()
+	var out []*job.Worker
+	for rows.Next() {
+		w, err := scanWorkerRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: list workers: %w", err)
+	}
+	return out, nil
+}
+
+// SetLastSeen is used by tests to age a worker past the lost threshold.
+func (s *Store) SetLastSeen(ctx context.Context, id string, t time.Time) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE workers SET last_seen = ? WHERE id = ?`, formatTime(t.UTC()), id)
+	if err != nil {
+		return fmt.Errorf("store: set last_seen: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: set last_seen: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: worker %s not found", id)
+	}
+	return nil
 }

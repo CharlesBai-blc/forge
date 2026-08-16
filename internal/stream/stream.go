@@ -134,6 +134,32 @@ func (s *Stream) Has(ctx context.Context, jobID string) (bool, error) {
 	return false, nil
 }
 
+const sweeperConsumer = "sweeper"
+
+// AutoClaim takes pending entries idle longer than minIdle (FR-11).
+func (s *Stream) AutoClaim(ctx context.Context, minIdle time.Duration) ([]Message, error) {
+	msgs, _, err := s.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+		Stream:   name,
+		Group:    group,
+		Consumer: sweeperConsumer,
+		MinIdle:  minIdle,
+		Start:    "0-0",
+		Count:    100,
+	}).Result()
+	if err != nil {
+		return nil, fmt.Errorf("stream: xautoclaim: %w", err)
+	}
+	out := make([]Message, 0, len(msgs))
+	for _, m := range msgs {
+		jobID, _ := m.Values["id"].(string)
+		if jobID == "" {
+			continue
+		}
+		out = append(out, Message{ID: m.ID, JobID: jobID})
+	}
+	return out, nil
+}
+
 // Reconcile XADDs queued job IDs that are missing from the stream (tdd.md §6.2).
 func (s *Stream) Reconcile(ctx context.Context, queued []string) error {
 	for _, id := range queued {

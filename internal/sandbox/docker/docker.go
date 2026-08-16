@@ -39,6 +39,12 @@ func NewProvider() (*Provider, error) {
 	return &Provider{cli: cli}, nil
 }
 
+// Ping reports whether the Docker daemon is reachable (FR-18).
+func (p *Provider) Ping(ctx context.Context) error {
+	_, err := p.cli.Ping(ctx)
+	return err
+}
+
 // Close closes the Docker client.
 func (p *Provider) Close() error {
 	return p.cli.Close()

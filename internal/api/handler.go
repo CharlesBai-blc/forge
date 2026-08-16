@@ -22,18 +22,28 @@ import (
 	"github.com/CharlesBai-blc/forge/internal/stream"
 )
 
-const defaultClaimWait = 30 * time.Second
+const (
+	defaultClaimWait   = 30 * time.Second
+	defaultLostAfter   = 30 * time.Second
+	defaultVisibility  = 60 * time.Second
+	defaultMaxAttempts = 2
+	defaultSweepEvery  = 10 * time.Second
+)
 
 // Handler serves claim, status, and log upload (FR-10, FR-9, FR-26).
 type Handler struct {
-	Store     *store.Store
-	Stream    *stream.Stream
-	Source    source.RunnerSource
-	Image     string
-	Command   []string
-	LogDir    string
-	Log       *slog.Logger
-	ClaimWait time.Duration
+	Store       *store.Store
+	Stream      *stream.Stream
+	Source      source.RunnerSource
+	Image       string
+	Command     []string
+	LogDir      string
+	Log         *slog.Logger
+	ClaimWait   time.Duration
+	LostAfter   time.Duration
+	Visibility  time.Duration
+	MaxAttempts int
+	SweepEvery  time.Duration
 
 	mu   sync.Mutex
 	jits map[string]int64  // jobID/attempt -> GitHub runner ID, until consumed
@@ -43,6 +53,7 @@ type Handler struct {
 // Register attaches agent routes to mux.
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/agents/enroll", h.enroll)
+	mux.HandleFunc("POST /v1/agents/{id}/heartbeat", h.heartbeat)
 	mux.HandleFunc("GET /v1/agents/{id}/claim", h.claim)
 	mux.HandleFunc("POST /v1/jobs/{id}/attempts/{n}/status", h.status)
 	mux.HandleFunc("POST /v1/jobs/{id}/attempts/{n}/logs", h.logs)
@@ -80,6 +91,29 @@ func (h *Handler) enroll(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(EnrollResponse{WorkerID: id, Token: tok})
 }
 
+func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
+	wk, ok := h.worker(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.PathValue("id") != wk.ID {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var hb Heartbeat
+	if err := json.NewDecoder(r.Body).Decode(&hb); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if err := h.Store.Heartbeat(r.Context(), wk.ID, hb.Capacity, hb.Healthy); err != nil {
+		h.log().Error("heartbeat", "worker", wk.ID, "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *Handler) worker(r *http.Request) (*job.Worker, bool) {
 	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok || got == "" {
@@ -105,6 +139,10 @@ func (h *Handler) claim(w http.ResponseWriter, r *http.Request) {
 	}
 	if wk.State != job.WorkerActive {
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if !wk.Healthy {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
