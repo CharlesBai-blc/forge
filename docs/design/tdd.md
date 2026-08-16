@@ -89,7 +89,7 @@ const (
 
 // Job is the control plane's record of one unit of work (FR-9).
 type Job struct {
-	ID           string   // ULID, assigned at intake
+	ID           string   // random 128-bit hex, assigned at intake
 	Source       string   // "github"
 	ExternalID   int64    // GitHub workflow_job ID
 	Repo         string   // "owner/name"
@@ -126,7 +126,7 @@ const (
 
 // Worker is one enrolled machine (FR-18).
 type Worker struct {
-	ID        string // ULID, assigned at enrollment
+	ID        string // random 128-bit hex, assigned at enrollment
 	Name      string // hostname, informational
 	Labels    []string
 	Capacity  int // max concurrent jobs
@@ -177,7 +177,7 @@ stateDiagram-v2
 | active, cordoned | draining | operator drain (FR-19) |
 | draining | cordoned | drain complete: assigned-not-started jobs requeued, running jobs finished |
 | active, cordoned, draining | lost | 3 consecutive missed heartbeats (FR-20) |
-| lost | active | heartbeat resumes with the same per-machine token; no new enrollment token needed (FR-20 clean re-enroll) |
+| lost | previous operational state | heartbeat resumes with the same per-machine token; no new enrollment token needed (FR-20 clean re-enroll). The worker returns to the state it held before going lost (active, cordoned, or draining), so operator cordon and drain intent survives an agent restart (FR-19) |
 | cordoned, lost | removed | operator remove; token revoked (FR-27) |
 
 `removed` is terminal. A removed machine re-enrolls as a new worker with a new enrollment token.
@@ -457,7 +457,7 @@ Every performance and security claim in the README cites a row of this table, pe
 
 ```sql
 CREATE TABLE jobs (
-    id            TEXT PRIMARY KEY,          -- ULID
+    id            TEXT PRIMARY KEY,          -- random 128-bit hex
     source        TEXT NOT NULL,             -- 'github'
     external_id   INTEGER NOT NULL,
     repo          TEXT NOT NULL,
@@ -484,7 +484,7 @@ CREATE TABLE transitions (
 );
 
 CREATE TABLE workers (
-    id         TEXT PRIMARY KEY,             -- ULID
+    id         TEXT PRIMARY KEY,             -- random 128-bit hex
     name       TEXT NOT NULL,
     labels     TEXT NOT NULL,                -- JSON array
     capacity   INTEGER NOT NULL,
@@ -535,6 +535,10 @@ All settable via config file, flag, or env (FR-2). The chaos suite runs against 
 | visibility timeout | 60s | must exceed lost threshold |
 | max attempts (dead-letter) | 2 | FR-12 |
 | claim long-poll timeout | 30s | |
+| sandbox CPU limit | 2.0 | FR-14 |
+| sandbox memory limit | 4 GiB | FR-14 |
+| sandbox PID limit | 4096 | FR-14 |
+| sandbox disk limit | none until M4 | storage-driver dependent, ships with FR-15 |
 | warm pool size per label set | 2 | FR-16 |
 | log retention | 30 days / 5 GiB | oldest first |
 | burst up window | 120s | FR-21 |
