@@ -29,9 +29,11 @@ type fakeSandbox struct {
 	exitCode int
 	waitErr  error
 	started  bool
-	destroys int
 	jit      string
 	logs     string
+
+	mu       sync.Mutex
+	destroys int
 }
 
 func (s *fakeSandbox) ID() string { return s.id }
@@ -57,8 +59,16 @@ func (s *fakeSandbox) Logs(context.Context) (io.ReadCloser, error) {
 }
 
 func (s *fakeSandbox) Destroy(context.Context) error {
+	s.mu.Lock()
 	s.destroys++
+	s.mu.Unlock()
 	return nil
+}
+
+func (s *fakeSandbox) destroyCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.destroys
 }
 
 type fakeProvider struct {
@@ -221,6 +231,18 @@ func waitState(t *testing.T, st *store.Store, id string, want job.JobState) *job
 	return nil
 }
 
+func waitDestroyed(t *testing.T, sb *fakeSandbox, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if sb.destroyCount() == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("destroys = %d, want %d", sb.destroyCount(), want)
+}
+
 func TestRunSucceeded(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1"}}
 	st, jobs, r, src, _ := openHarness(t, p)
@@ -235,9 +257,7 @@ func TestRunSucceeded(t *testing.T) {
 	}
 
 	got := waitState(t, st, j.ID, job.JobSucceeded)
-	if p.sb.destroys != 1 {
-		t.Errorf("destroys = %d, want 1", p.sb.destroys)
-	}
+	waitDestroyed(t, p.sb, 1)
 	if p.sb.jit != "jit-blob" {
 		t.Errorf("Start jit = %q, want jit-blob", p.sb.jit)
 	}
@@ -266,9 +286,7 @@ func TestRunNonzeroExitFailed(t *testing.T) {
 	}
 
 	got := waitState(t, st, j.ID, job.JobFailed)
-	if p.sb.destroys != 1 {
-		t.Errorf("destroys = %d, want 1", p.sb.destroys)
-	}
+	waitDestroyed(t, p.sb, 1)
 	if got.Reason != "exit 7" {
 		t.Errorf("Reason = %q, want exit 7", got.Reason)
 	}
@@ -307,9 +325,7 @@ func TestStartErrorDestroysAndFails(t *testing.T) {
 	}
 
 	waitState(t, st, j.ID, job.JobFailed)
-	if p.sb.destroys != 1 {
-		t.Errorf("destroys = %d, want 1", p.sb.destroys)
-	}
+	waitDestroyed(t, p.sb, 1)
 	if ids := src.unregisterIDs(); len(ids) != 1 || ids[0] != 1 {
 		t.Errorf("Unregister = %v, want [1]", ids)
 	}
@@ -339,7 +355,7 @@ func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 			if got.State != job.JobQueued {
 				t.Fatalf("State = %s, want queued", got.State)
 			}
-			if p.sb.started || p.sb.destroys != 0 {
+			if p.sb.started || p.sb.destroyCount() != 0 {
 				t.Fatalf("sandbox used on register failure")
 			}
 			return
