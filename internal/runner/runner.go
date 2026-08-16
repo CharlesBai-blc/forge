@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	defaultHeartbeat = 10 * time.Second
-	defaultCapacity  = 1
+	defaultHeartbeat     = 10 * time.Second
+	defaultCapacity      = 1
+	defaultStatusBackoff = time.Second
 )
 
 // Runner claims jobs from the control plane and runs each in a fresh sandbox.
@@ -25,10 +26,31 @@ type Runner struct {
 	Provider       sandbox.Provider
 	Log            *slog.Logger
 	HeartbeatEvery time.Duration
+	Outbox         *Outbox
+	StatusBackoff  time.Duration
 
 	mu      sync.Mutex
 	current string
 	healthy bool
+}
+
+func (r *Runner) outbox() *Outbox {
+	if r.Outbox != nil {
+		return r.Outbox
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.Outbox == nil {
+		r.Outbox = &Outbox{}
+	}
+	return r.Outbox
+}
+
+func (r *Runner) statusBackoff() time.Duration {
+	if r.StatusBackoff > 0 {
+		return r.StatusBackoff
+	}
+	return defaultStatusBackoff
 }
 
 // Run claims jobs until ctx is cancelled.
@@ -39,6 +61,18 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.setHealthy(true)
 	go r.heartbeatLoop(ctx)
 	for {
+		if err := r.flushStatus(ctx); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			r.Log.Error("status flush", "err", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(r.statusBackoff()):
+			}
+			continue
+		}
 		if !r.isHealthy() {
 			select {
 			case <-ctx.Done():
@@ -137,9 +171,7 @@ func (r *Runner) currentJob() string {
 // runOne runs one claimed job. Destroy runs on every exit path (FR-13).
 func (r *Runner) runOne(ctx context.Context, cl *api.ClaimResponse) {
 	report := func(rep api.StatusReport) {
-		if err := r.Client.Status(context.Background(), cl.JobID, cl.Attempt, rep); err != nil {
-			r.Log.Error("status", "job", cl.JobID, "err", err)
-		}
+		r.report(ctx, cl.JobID, cl.Attempt, rep)
 	}
 
 	sb, err := r.Provider.Create(ctx, cl.Spec)
@@ -171,6 +203,49 @@ func (r *Runner) runOne(ctx context.Context, cl *api.ClaimResponse) {
 	}
 	c := code
 	report(api.StatusReport{State: job.JobFailed, ExitCode: &c, Reason: fmt.Sprintf("exit %d", code)})
+}
+
+func (r *Runner) report(ctx context.Context, jobID string, attempt int, rep api.StatusReport) {
+	if err := r.outbox().Push(jobID, attempt, rep); err != nil {
+		r.Log.Error("status persist", "job", jobID, "err", err)
+	}
+	if err := r.flushStatus(ctx); err != nil && ctx.Err() == nil {
+		r.Log.Error("status flush", "job", jobID, "err", err)
+	}
+}
+
+func (r *Runner) flushStatus(ctx context.Context) error {
+	box := r.outbox()
+	backoff := r.statusBackoff()
+	for {
+		item, ok := box.Peek()
+		if !ok {
+			return nil
+		}
+		err := r.Client.Status(ctx, item.JobID, item.Attempt, item.Report)
+		if err == nil || !api.StatusRetryable(err) {
+			if err != nil && ctx.Err() == nil {
+				r.Log.Error("status", "job", item.JobID, "err", err)
+			}
+			if perr := box.Pop(); perr != nil {
+				return perr
+			}
+			backoff = r.statusBackoff()
+			continue
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		r.Log.Error("status retry", "job", item.JobID, "err", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
 }
 
 func (r *Runner) uploadLogs(ctx context.Context, sb sandbox.Sandbox, cl *api.ClaimResponse) {

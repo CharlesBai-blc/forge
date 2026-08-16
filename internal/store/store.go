@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,7 +30,7 @@ type Store struct {
 // Open opens the database at path, creating it if needed, and applies
 // pending migrations.
 func Open(ctx context.Context, path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("store: open %s: %w", path, err)
 	}

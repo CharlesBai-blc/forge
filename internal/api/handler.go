@@ -244,16 +244,27 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if j.State == rep.State && statusIdempotent(rep.State) {
+		if rep.State == job.JobSucceeded || rep.State == job.JobFailed {
+			h.ackJob(jobID)
+		}
+		if rep.State == job.JobRunning {
+			h.forgetJIT(jobID, n, false)
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	switch rep.State {
 	case job.JobRunning:
 		if err := h.Store.Transition(r.Context(), jobID, job.JobRunning, ""); err != nil {
-			http.Error(w, "conflict", http.StatusConflict)
+			h.statusStoreError(w, jobID, err)
 			return
 		}
 		h.forgetJIT(jobID, n, false)
 	case job.JobSucceeded:
 		if err := h.Store.Transition(r.Context(), jobID, job.JobSucceeded, rep.Reason); err != nil {
-			http.Error(w, "conflict", http.StatusConflict)
+			h.statusStoreError(w, jobID, err)
 			return
 		}
 		h.forgetJIT(jobID, n, false)
@@ -265,13 +276,13 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		}
 		if j.State == job.JobAssigned {
 			if err := h.Store.Transition(r.Context(), jobID, job.JobLost, reason); err != nil {
-				http.Error(w, "conflict", http.StatusConflict)
+				h.statusStoreError(w, jobID, err)
 				return
 			}
 			h.forgetJIT(jobID, n, true)
 		}
 		if err := h.Store.Transition(r.Context(), jobID, job.JobFailed, reason); err != nil {
-			http.Error(w, "conflict", http.StatusConflict)
+			h.statusStoreError(w, jobID, err)
 			return
 		}
 		h.forgetJIT(jobID, n, false)
@@ -281,6 +292,19 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func statusIdempotent(s job.JobState) bool {
+	return s == job.JobRunning || s == job.JobSucceeded || s == job.JobFailed
+}
+
+func (h *Handler) statusStoreError(w http.ResponseWriter, jobID string, err error) {
+	if errors.Is(err, job.ErrInvalidTransition) {
+		http.Error(w, "conflict", http.StatusConflict)
+		return
+	}
+	h.log().Error("status", "job", jobID, "err", err)
+	http.Error(w, "internal error", http.StatusInternalServerError)
 }
 
 func (h *Handler) logs(w http.ResponseWriter, r *http.Request) {

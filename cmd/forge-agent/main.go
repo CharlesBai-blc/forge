@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 
@@ -34,6 +35,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	box, err := runner.OpenOutbox(filepath.Join(*dataDir, "status.json"))
+	if err != nil {
+		log.Error("forge-agent", "err", err)
+		os.Exit(1)
+	}
+
 	p, err := dockersandbox.NewProvider()
 	if err != nil {
 		log.Error("forge-agent", "err", err)
@@ -45,6 +52,7 @@ func main() {
 		Client:   c,
 		Provider: p,
 		Log:      log,
+		Outbox:   box,
 	}
 	log.Info("forge-agent starting", "addr", *addr, "id", c.WorkerID)
 	if err := r.Run(ctx); err != nil && ctx.Err() == nil {

@@ -347,6 +347,9 @@ func TestStaleAttemptRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for stale attempt")
 	}
+	if StatusRetryable(err) {
+		t.Fatalf("stale attempt retryable: %v", err)
+	}
 }
 
 func TestStatusWrongWorker(t *testing.T) {
@@ -361,6 +364,38 @@ func TestStatusWrongWorker(t *testing.T) {
 	err = other.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobRunning})
 	if err == nil {
 		t.Fatal("expected error for other worker")
+	}
+	if StatusRetryable(err) {
+		t.Fatalf("wrong worker retryable: %v", err)
+	}
+}
+
+func TestStatusDuplicateIsNoContent(t *testing.T) {
+	st, jobs, _, c, _, _ := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-dup", 21))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	rep := StatusReport{State: job.JobRunning}
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, rep); err != nil {
+		t.Fatalf("running: %v", err)
+	}
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, rep); err != nil {
+		t.Fatalf("duplicate running: %v", err)
+	}
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobSucceeded}); err != nil {
+		t.Fatalf("succeeded: %v", err)
+	}
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobSucceeded}); err != nil {
+		t.Fatalf("duplicate succeeded: %v", err)
+	}
+	row, err := st.GetJob(context.Background(), cl.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobSucceeded {
+		t.Fatalf("State = %s", row.State)
 	}
 }
 
