@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/CharlesBai-blc/forge/internal/job"
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
 	dockersandbox "github.com/CharlesBai-blc/forge/internal/sandbox/docker"
+	"github.com/CharlesBai-blc/forge/internal/source/github"
 
 	_ "modernc.org/sqlite"
 )
@@ -78,7 +80,13 @@ func TestValidateRequiredFlags(t *testing.T) {
 		}
 	}
 	ok := config{
-		dataDir: t.TempDir(), webhookSecret: "s", image: "alpine:3.20", command: []string{"true"},
+		dataDir:       t.TempDir(),
+		webhookSecret: "s",
+		githubToken:   "tok",
+		githubOwner:   "owner",
+		githubRepo:    "name",
+		image:         "alpine:3.20",
+		command:       []string{"true"},
 	}
 	if err := ok.validate(); err != nil {
 		t.Fatalf("validate: %v", err)
@@ -115,15 +123,37 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 	}
 	prov := &recordingProvider{inner: inner}
 
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/generate-jitconfig") {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"runner":{"id":1},"encoded_jit_config":"jit-blob"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(gh.Close)
+
+	src := &github.Source{
+		Secret:  testSecret,
+		Token:   "tok",
+		Owner:   "owner",
+		Repo:    "name",
+		BaseURL: gh.URL,
+		Client:  gh.Client(),
+	}
+
 	cfg := config{
 		dataDir:       t.TempDir(),
 		webhookSecret: testSecret,
+		githubToken:   "tok",
+		githubOwner:   "owner",
+		githubRepo:    "name",
 		image:         "alpine:3.20",
 		command:       []string{"true"},
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	appCtx, appCancel := context.WithCancel(context.Background())
-	a, err := newApp(appCtx, cfg, log, prov)
+	a, err := newApp(appCtx, cfg, log, prov, src)
 	if err != nil {
 		appCancel()
 		t.Fatalf("newApp: %v", err)

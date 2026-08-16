@@ -5,14 +5,17 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/CharlesBai-blc/forge/internal/job"
 	"github.com/CharlesBai-blc/forge/internal/queue"
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
+	"github.com/CharlesBai-blc/forge/internal/source"
 	"github.com/CharlesBai-blc/forge/internal/store"
 )
 
@@ -23,14 +26,16 @@ type fakeSandbox struct {
 	waitErr  error
 	started  bool
 	destroys int
+	jit      string
 }
 
 func (s *fakeSandbox) ID() string { return s.id }
 
-func (s *fakeSandbox) Start(context.Context, string) error {
+func (s *fakeSandbox) Start(_ context.Context, jit string) error {
 	if s.started {
 		return fmt.Errorf("already started")
 	}
+	s.jit = jit
 	if s.startErr != nil {
 		return s.startErr
 	}
@@ -66,6 +71,56 @@ func (p *fakeProvider) Create(context.Context, sandbox.Spec) (sandbox.Sandbox, e
 	return p.sb, nil
 }
 
+type fakeSource struct {
+	mu          sync.Mutex
+	jit         *source.JITConfig
+	registerErr error
+	registers   int
+	unregisters []int64
+}
+
+func (s *fakeSource) VerifyAndParse(*http.Request) ([]source.JobEvent, error) {
+	return nil, nil
+}
+
+func (s *fakeSource) RegisterJIT(context.Context, *job.Job) (*source.JITConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.registers++
+	if s.registerErr != nil {
+		return nil, s.registerErr
+	}
+	if s.jit == nil {
+		s.jit = &source.JITConfig{RunnerID: 1, Encoded: "jit-blob"}
+	}
+	return s.jit, nil
+}
+
+func (s *fakeSource) Unregister(_ context.Context, runnerID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unregisters = append(s.unregisters, runnerID)
+	return nil
+}
+
+func (s *fakeSource) ListQueued(context.Context) ([]source.JobEvent, error) {
+	return nil, nil
+}
+
+func (s *fakeSource) registerCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.registers
+}
+
+func (s *fakeSource) unregisterIDs() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]int64, len(s.unregisters))
+	copy(out, s.unregisters)
+	return out
+}
+
 func testJob(id string, external int64) *job.Job {
 	return &job.Job{
 		ID:         id,
@@ -93,23 +148,25 @@ func startRunner(t *testing.T, r *Runner) (context.CancelFunc, <-chan error) {
 	return cancel, done
 }
 
-func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *queue.Queue, *Runner) {
+func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *queue.Queue, *Runner, *fakeSource) {
 	t.Helper()
 	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "forge.db"))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
+	src := &fakeSource{jit: &source.JITConfig{RunnerID: 1, Encoded: "jit-blob"}}
 	q := queue.New()
 	r := &Runner{
 		Queue:    q,
 		Store:    st,
 		Provider: p,
+		Source:   src,
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Image:    "alpine:3.20",
 		Command:  []string{"true"},
 	}
-	return st, q, r
+	return st, q, r, src
 }
 
 func waitState(t *testing.T, st *store.Store, id string, want job.JobState) *job.Job {
@@ -129,7 +186,7 @@ func waitState(t *testing.T, st *store.Store, id string, want job.JobState) *job
 
 func TestRunSucceeded(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1"}}
-	st, q, r := openHarness(t, p)
+	st, q, r, src := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-ok", 1)
@@ -144,6 +201,15 @@ func TestRunSucceeded(t *testing.T) {
 	if p.sb.destroys != 1 {
 		t.Errorf("destroys = %d, want 1", p.sb.destroys)
 	}
+	if p.sb.jit != "jit-blob" {
+		t.Errorf("Start jit = %q, want jit-blob", p.sb.jit)
+	}
+	if n := src.registerCount(); n != 1 {
+		t.Errorf("RegisterJIT calls = %d, want 1", n)
+	}
+	if ids := src.unregisterIDs(); len(ids) != 0 {
+		t.Errorf("Unregister = %v, want none after Start", ids)
+	}
 	if got.State != job.JobSucceeded {
 		t.Errorf("State = %s, want succeeded", got.State)
 	}
@@ -151,7 +217,7 @@ func TestRunSucceeded(t *testing.T) {
 
 func TestRunNonzeroExitFailed(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1", exitCode: 7}}
-	st, q, r := openHarness(t, p)
+	st, q, r, _ := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-fail", 2)
@@ -173,7 +239,7 @@ func TestRunNonzeroExitFailed(t *testing.T) {
 
 func TestCreateErrorFailsJob(t *testing.T) {
 	p := &fakeProvider{createErr: fmt.Errorf("no docker")}
-	st, q, r := openHarness(t, p)
+	st, q, r, src := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-create", 3)
@@ -185,11 +251,14 @@ func TestCreateErrorFailsJob(t *testing.T) {
 	}
 
 	waitState(t, st, j.ID, job.JobFailed)
+	if ids := src.unregisterIDs(); len(ids) != 1 || ids[0] != 1 {
+		t.Errorf("Unregister = %v, want [1]", ids)
+	}
 }
 
 func TestStartErrorDestroysAndFails(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1", startErr: fmt.Errorf("start failed")}}
-	st, q, r := openHarness(t, p)
+	st, q, r, src := openHarness(t, p)
 	startRunner(t, r)
 
 	j := testJob("job-start", 4)
@@ -204,12 +273,48 @@ func TestStartErrorDestroysAndFails(t *testing.T) {
 	if p.sb.destroys != 1 {
 		t.Errorf("destroys = %d, want 1", p.sb.destroys)
 	}
+	if ids := src.unregisterIDs(); len(ids) != 1 || ids[0] != 1 {
+		t.Errorf("Unregister = %v, want [1]", ids)
+	}
+}
+
+func TestRegisterJITErrorLeavesQueued(t *testing.T) {
+	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1"}}
+	st, q, r, src := openHarness(t, p)
+	src.registerErr = fmt.Errorf("github down")
+	startRunner(t, r)
+
+	j := testJob("job-jit", 5)
+	if err := st.CreateJob(context.Background(), j); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if err := q.Enqueue(j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if src.registerCount() >= 1 {
+			got, err := st.GetJob(context.Background(), j.ID)
+			if err != nil {
+				t.Fatalf("GetJob: %v", err)
+			}
+			if got.State != job.JobQueued {
+				t.Fatalf("State = %s, want queued", got.State)
+			}
+			if p.sb.started || p.sb.destroys != 0 {
+				t.Fatalf("sandbox used on register failure")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("RegisterJIT not called")
 }
 
 func TestRunCancelled(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1"}}
-	_, _, r := openHarness(t, p)
+	_, _, r, _ := openHarness(t, p)
 	cancel, _ := startRunner(t, r)
 	cancel()
-	// Cleanup waits for Run to return.
 }

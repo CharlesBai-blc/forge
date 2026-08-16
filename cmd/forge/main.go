@@ -18,14 +18,19 @@ import (
 	"github.com/CharlesBai-blc/forge/internal/runner"
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
 	dockersandbox "github.com/CharlesBai-blc/forge/internal/sandbox/docker"
+	"github.com/CharlesBai-blc/forge/internal/source"
+	"github.com/CharlesBai-blc/forge/internal/source/github"
 	"github.com/CharlesBai-blc/forge/internal/store"
-	"github.com/CharlesBai-blc/forge/internal/trigger"
 )
 
 type config struct {
 	addr          string
 	dataDir       string
 	webhookSecret string
+	githubToken   string
+	githubOwner   string
+	githubRepo    string
+	githubOrg     string
 	image         string
 	command       []string
 }
@@ -45,13 +50,21 @@ func parseFlags() config {
 	addr := flag.String("addr", envOr("FORGE_ADDR", ":8080"), "listen address")
 	dataDir := flag.String("data-dir", envOr("FORGE_DATA_DIR", "./data"), "data directory")
 	webhookSecret := flag.String("webhook-secret", os.Getenv("FORGE_WEBHOOK_SECRET"), "GitHub webhook secret")
-	image := flag.String("image", envOr("FORGE_JOB_IMAGE", ""), "fixed sandbox image")
-	command := flag.String("command", envOr("FORGE_JOB_COMMAND", ""), "fixed command to run")
+	githubToken := flag.String("github-token", os.Getenv("FORGE_GITHUB_TOKEN"), "GitHub PAT or installation token")
+	githubOwner := flag.String("github-owner", envOr("FORGE_GITHUB_OWNER", ""), "GitHub repo owner")
+	githubRepo := flag.String("github-repo", envOr("FORGE_GITHUB_REPO", ""), "GitHub repo name")
+	githubOrg := flag.String("github-org", envOr("FORGE_GITHUB_ORG", ""), "GitHub org (org-level registration)")
+	image := flag.String("image", envOr("FORGE_JOB_IMAGE", ""), "sandbox image")
+	command := flag.String("command", envOr("FORGE_JOB_COMMAND", ""), "command to run in the sandbox")
 	flag.Parse()
 	return config{
 		addr:          *addr,
 		dataDir:       *dataDir,
 		webhookSecret: *webhookSecret,
+		githubToken:   *githubToken,
+		githubOwner:   *githubOwner,
+		githubRepo:    *githubRepo,
+		githubOrg:     *githubOrg,
 		image:         *image,
 		command:       strings.Fields(*command),
 	}
@@ -74,6 +87,12 @@ func (c config) validate() error {
 	if c.webhookSecret == "" {
 		return fmt.Errorf("forge: -webhook-secret is required")
 	}
+	if c.githubToken == "" {
+		return fmt.Errorf("forge: -github-token is required")
+	}
+	if c.githubOrg == "" && (c.githubOwner == "" || c.githubRepo == "") {
+		return fmt.Errorf("forge: -github-owner and -github-repo, or -github-org, are required")
+	}
 	if c.dataDir == "" {
 		return fmt.Errorf("forge: -data-dir is required")
 	}
@@ -87,7 +106,10 @@ type app struct {
 	provider sandbox.Provider
 }
 
-func newApp(ctx context.Context, cfg config, log *slog.Logger, provider sandbox.Provider) (*app, error) {
+func newApp(ctx context.Context, cfg config, log *slog.Logger, provider sandbox.Provider, src source.RunnerSource) (*app, error) {
+	if src == nil {
+		return nil, fmt.Errorf("forge: source required")
+	}
 	if err := os.MkdirAll(cfg.dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("forge: data dir: %w", err)
 	}
@@ -100,13 +122,14 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, provider sandbox.
 		Queue:    q,
 		Store:    st,
 		Provider: provider,
+		Source:   src,
 		Log:      log,
 		Image:    cfg.image,
 		Command:  cfg.command,
 	}
-	h := &trigger.Handler{
-		Config: trigger.Config{WebhookSecret: cfg.webhookSecret, Image: cfg.image, Command: cfg.command},
-		OnJob: func(j *job.Job) error {
+	h := &webhookHandler{
+		src: src,
+		onJob: func(j *job.Job) error {
 			if err := st.CreateJob(ctx, j); err != nil {
 				return err
 			}
@@ -133,7 +156,14 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	a, err := newApp(ctx, cfg, log, p)
+	src := &github.Source{
+		Secret: cfg.webhookSecret,
+		Token:  cfg.githubToken,
+		Owner:  cfg.githubOwner,
+		Repo:   cfg.githubRepo,
+		Org:    cfg.githubOrg,
+	}
+	a, err := newApp(ctx, cfg, log, p, src)
 	if err != nil {
 		p.Close()
 		return err

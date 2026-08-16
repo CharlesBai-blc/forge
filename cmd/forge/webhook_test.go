@@ -1,4 +1,4 @@
-package trigger
+package main
 
 import (
 	"bytes"
@@ -11,12 +11,11 @@ import (
 	"testing"
 
 	"github.com/CharlesBai-blc/forge/internal/job"
+	"github.com/CharlesBai-blc/forge/internal/source/github"
 )
 
-const testSecret = "test-secret"
-
-func sign(body []byte) string {
-	mac := hmac.New(sha256.New, []byte(testSecret))
+func signBody(secret string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
@@ -29,7 +28,7 @@ func queuedBody() []byte {
 	}`)
 }
 
-func do(h http.Handler, method, event, sig string, body []byte) *httptest.ResponseRecorder {
+func doWebhook(h http.Handler, method, event, sig string, body []byte) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, "/webhook/github", bytes.NewReader(body))
 	if event != "" {
 		req.Header.Set("X-GitHub-Event", event)
@@ -42,22 +41,26 @@ func do(h http.Handler, method, event, sig string, body []byte) *httptest.Respon
 	return rec
 }
 
+func testWebhook(onJob func(*job.Job) error) *webhookHandler {
+	return &webhookHandler{
+		src:   &github.Source{Secret: testSecret},
+		onJob: onJob,
+	}
+}
+
 func TestQueuedWorkflowJobAccepted(t *testing.T) {
 	var got *job.Job
-	h := &Handler{
-		Config: Config{WebhookSecret: testSecret},
-		OnJob: func(j *job.Job) error {
-			got = j
-			return nil
-		},
-	}
+	h := testWebhook(func(j *job.Job) error {
+		got = j
+		return nil
+	})
 	body := queuedBody()
-	rec := do(h, http.MethodPost, "workflow_job", sign(body), body)
+	rec := doWebhook(h, http.MethodPost, "workflow_job", signBody(testSecret, body), body)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusAccepted)
 	}
 	if got == nil {
-		t.Fatal("OnJob not called")
+		t.Fatal("onJob not called")
 	}
 	if got.Source != "github" || got.State != job.JobQueued {
 		t.Errorf("Source/State = %s %s, want github queued", got.Source, got.State)
@@ -72,75 +75,60 @@ func TestQueuedWorkflowJobAccepted(t *testing.T) {
 
 func TestMissingSignatureUnauthorized(t *testing.T) {
 	called := false
-	h := &Handler{
-		Config: Config{WebhookSecret: testSecret},
-		OnJob:  func(*job.Job) error { called = true; return nil },
-	}
+	h := testWebhook(func(*job.Job) error { called = true; return nil })
 	body := queuedBody()
-	rec := do(h, http.MethodPost, "workflow_job", "", body)
+	rec := doWebhook(h, http.MethodPost, "workflow_job", "", body)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
 	}
 	if called {
-		t.Fatal("OnJob called")
+		t.Fatal("onJob called")
 	}
 }
 
 func TestBadSignatureUnauthorized(t *testing.T) {
 	called := false
-	h := &Handler{
-		Config: Config{WebhookSecret: testSecret},
-		OnJob:  func(*job.Job) error { called = true; return nil },
-	}
+	h := testWebhook(func(*job.Job) error { called = true; return nil })
 	body := queuedBody()
-	rec := do(h, http.MethodPost, "workflow_job", "sha256=00", body)
+	rec := doWebhook(h, http.MethodPost, "workflow_job", "sha256=00", body)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
 	}
 	if called {
-		t.Fatal("OnJob called")
+		t.Fatal("onJob called")
 	}
 }
 
 func TestOtherEventNoContent(t *testing.T) {
 	called := false
-	h := &Handler{
-		Config: Config{WebhookSecret: testSecret},
-		OnJob:  func(*job.Job) error { called = true; return nil },
-	}
+	h := testWebhook(func(*job.Job) error { called = true; return nil })
 	body := []byte(`{"zen": "ok"}`)
-	rec := do(h, http.MethodPost, "ping", sign(body), body)
+	rec := doWebhook(h, http.MethodPost, "ping", signBody(testSecret, body), body)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
 	}
 	if called {
-		t.Fatal("OnJob called")
+		t.Fatal("onJob called")
 	}
 }
 
 func TestCompletedActionNoContent(t *testing.T) {
 	called := false
-	h := &Handler{
-		Config: Config{WebhookSecret: testSecret},
-		OnJob:  func(*job.Job) error { called = true; return nil },
-	}
+	h := testWebhook(func(*job.Job) error { called = true; return nil })
 	body := []byte(`{"action": "completed", "workflow_job": {"id": 1}}`)
-	rec := do(h, http.MethodPost, "workflow_job", sign(body), body)
+	rec := doWebhook(h, http.MethodPost, "workflow_job", signBody(testSecret, body), body)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
 	}
 	if called {
-		t.Fatal("OnJob called")
+		t.Fatal("onJob called")
 	}
 }
 
 func TestOnJobErrorInternal(t *testing.T) {
-	h := &Handler{
-		Config: Config{WebhookSecret: testSecret},
-		OnJob:  func(*job.Job) error { return errors.New("boom") },
-	}
+	h := testWebhook(func(*job.Job) error { return errors.New("boom") })
 	body := queuedBody()
-	rec := do(h, http.MethodPost, "workflow_job", sign(body), body)
+	rec := doWebhook(h, http.MethodPost, "workflow_job", signBody(testSecret, body), body)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
 	}
