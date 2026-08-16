@@ -192,6 +192,7 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, provider sandbox.
 		Log:      log,
 		Image:    cfg.image,
 		Command:  cfg.command,
+		LogDir:   filepath.Join(cfg.dataDir, "logs"),
 	}
 	h := &webhookHandler{
 		src: src,

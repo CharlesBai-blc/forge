@@ -4,7 +4,10 @@ package runner
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 
 	"github.com/CharlesBai-blc/forge/internal/job"
 	"github.com/CharlesBai-blc/forge/internal/queue"
@@ -23,6 +26,7 @@ type Runner struct {
 
 	Image   string
 	Command []string
+	LogDir  string
 }
 
 // Run claims jobs until ctx is cancelled.
@@ -91,7 +95,14 @@ func (r *Runner) runOne(ctx context.Context, j *job.Job) {
 
 	r.transition(storeCtx, j.ID, job.JobRunning, "")
 
+	logsDone := make(chan struct{})
+	go func() {
+		defer close(logsDone)
+		r.writeLogs(ctx, sb, j)
+	}()
+
 	code, err := sb.Wait(ctx)
+	<-logsDone
 	if err != nil {
 		r.transition(storeCtx, j.ID, job.JobFailed, err.Error())
 		return
@@ -101,6 +112,32 @@ func (r *Runner) runOne(ctx context.Context, j *job.Job) {
 		return
 	}
 	r.transition(storeCtx, j.ID, job.JobFailed, fmt.Sprintf("exit %d", code))
+}
+
+func (r *Runner) writeLogs(ctx context.Context, sb sandbox.Sandbox, j *job.Job) {
+	if r.LogDir == "" {
+		return
+	}
+	if err := os.MkdirAll(r.LogDir, 0o755); err != nil {
+		r.Log.Error("logs dir", "job", j.ID, "err", err)
+		return
+	}
+	rc, err := sb.Logs(ctx)
+	if err != nil {
+		r.Log.Error("logs", "job", j.ID, "err", err)
+		return
+	}
+	defer rc.Close()
+	path := filepath.Join(r.LogDir, fmt.Sprintf("%s-%d.log", j.ID, j.Attempt))
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		r.Log.Error("logs file", "job", j.ID, "err", err)
+		return
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, rc); err != nil {
+		r.Log.Error("logs copy", "job", j.ID, "err", err)
+	}
 }
 
 func (r *Runner) transition(ctx context.Context, id string, to job.JobState, reason string) {

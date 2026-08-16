@@ -258,6 +258,9 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 	if state != job.JobSucceeded {
 		t.Fatalf("state = %s, want succeeded (job %s)", state, jobID)
 	}
+	if _, err := os.Stat(filepath.Join(cfg.dataDir, "logs", jobID+"-0.log")); err != nil {
+		t.Fatalf("job log: %v", err)
+	}
 
 	ids := prov.idsCopy()
 	if len(ids) == 0 {
