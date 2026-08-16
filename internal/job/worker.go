@@ -1,6 +1,9 @@
 package job
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 type WorkerState string
 
@@ -25,4 +28,22 @@ type Worker struct {
 	TokenHash []byte
 	Arch      string
 	Version   string
+}
+
+// workerTransitions is tdd.md §4.3. Drain and remove edges are
+// rejected until those features exist; listing them now keeps this
+// table from changing later.
+var workerTransitions = map[WorkerState]map[WorkerState]bool{
+	WorkerActive:   {WorkerCordoned: true, WorkerDraining: true, WorkerLost: true},
+	WorkerCordoned: {WorkerActive: true, WorkerDraining: true, WorkerLost: true, WorkerRemoved: true},
+	WorkerDraining: {WorkerCordoned: true, WorkerLost: true},
+	WorkerLost:     {WorkerActive: true, WorkerRemoved: true},
+	WorkerRemoved:  {},
+}
+
+func ValidateWorkerTransition(from, to WorkerState) error {
+	if workerTransitions[from][to] {
+		return nil
+	}
+	return fmt.Errorf("invalid worker transition: %s -> %s", from, to)
 }

@@ -165,6 +165,7 @@ type app struct {
 	store  *store.Store
 	mux    *http.ServeMux
 	stream *stream.Stream
+	api    *api.Handler
 }
 
 func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.RunnerSource) (*app, error) {
@@ -234,7 +235,7 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.Runner
 		Log:     log,
 	}
 	apiH.Register(mux)
-	return &app{store: st, mux: mux, stream: jobs}, nil
+	return &app{store: st, mux: mux, stream: jobs, api: apiH}, nil
 }
 
 func (a *app) Close() error {
@@ -253,6 +254,8 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 		return err
 	}
 	defer a.Close()
+
+	go a.api.RunSweep(ctx)
 
 	srv := &http.Server{Addr: cfg.addr, Handler: a.mux}
 	go func() {

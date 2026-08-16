@@ -93,3 +93,31 @@ func TestReconcileAddsMissing(t *testing.T) {
 		t.Fatalf("w2 claim = %s, want job-2", second.JobID)
 	}
 }
+
+func TestAutoClaimIdlePending(t *testing.T) {
+	s := testStream(t)
+	ctx := context.Background()
+	if err := s.Add(ctx, "job-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim(ctx, "w1", 50*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.AutoClaim(ctx, 0)
+	if err != nil {
+		t.Fatalf("AutoClaim: %v", err)
+	}
+	if len(got) != 1 || got[0].JobID != "job-1" {
+		t.Fatalf("AutoClaim = %+v", got)
+	}
+	if err := s.Ack(ctx, got[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	again, err := s.AutoClaim(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("after ack AutoClaim = %+v", again)
+	}
+}

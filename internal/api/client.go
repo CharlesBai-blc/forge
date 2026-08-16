@@ -118,3 +118,21 @@ func (c *Client) Logs(ctx context.Context, jobID string, attempt int, r io.Reade
 	}
 	return nil
 }
+
+// Heartbeat posts liveness, capacity, and Docker health (FR-18, FR-20).
+func (c *Client) Heartbeat(ctx context.Context, hb Heartbeat) error {
+	b, err := json.Marshal(hb)
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(ctx, http.MethodPost, "/v1/agents/"+c.WorkerID+"/heartbeat", bytes.NewReader(b), "application/json")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("api: heartbeat: status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+	}
+	return nil
+}

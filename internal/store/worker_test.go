@@ -110,3 +110,92 @@ func TestEnrollmentAndMachineTokensNotPlaintext(t *testing.T) {
 		t.Fatal("plaintext token found in database file")
 	}
 }
+
+func enrollTest(t *testing.T, s *Store) (id, token string) {
+	t.Helper()
+	ctx := context.Background()
+	tok, err := s.IssueEnrollmentToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, token, err = s.Enroll(ctx, tok, "host", "amd64", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id, token
+}
+
+func TestHeartbeatUpdatesAndRestoresLost(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	id, _ := enrollTest(t, s)
+	if err := s.MarkLost(ctx, id); err != nil {
+		t.Fatalf("MarkLost: %v", err)
+	}
+	if err := s.Heartbeat(ctx, id, 2, false); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	w, err := s.GetWorker(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.State != job.WorkerActive || w.Capacity != 2 || w.Healthy {
+		t.Fatalf("worker = %+v", w)
+	}
+}
+
+func TestMarkLostRejectsRemoved(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	id, _ := enrollTest(t, s)
+	if err := s.SetWorkerState(ctx, id, job.WorkerCordoned); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetWorkerState(ctx, id, job.WorkerRemoved); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkLost(ctx, id); err == nil {
+		t.Fatal("expected error marking removed worker lost")
+	}
+}
+
+func TestRequeueAndDeadLetter(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateJob(ctx, testJob("job-r")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Assign(ctx, "job-r", "w1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Transition(ctx, "job-r", job.JobLost, "visibility_timeout"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Requeue(ctx, "job-r"); err != nil {
+		t.Fatalf("Requeue: %v", err)
+	}
+	got, err := s.GetJob(ctx, "job-r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.JobQueued || got.WorkerID != "" || got.Attempt != 1 {
+		t.Fatalf("requeued = %+v", got)
+	}
+
+	if _, err := s.Assign(ctx, "job-r", "w2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Transition(ctx, "job-r", job.JobLost, "visibility_timeout"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeadLetter(ctx, "job-r", "max_attempts"); err != nil {
+		t.Fatalf("DeadLetter: %v", err)
+	}
+	got, err = s.GetJob(ctx, "job-r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.JobFailed || !got.DeadLettered || got.Reason != "max_attempts" {
+		t.Fatalf("dead letter = %+v", got)
+	}
+}

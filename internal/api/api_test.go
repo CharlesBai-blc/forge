@@ -96,7 +96,7 @@ func testJob(id string, external int64) *job.Job {
 	}
 }
 
-func openAPI(t *testing.T, src *fakeSource) (*store.Store, *stream.Stream, string, *Client, *fakeSource) {
+func openAPI(t *testing.T, src *fakeSource) (*store.Store, *stream.Stream, string, *Client, *fakeSource, *Handler) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(context.Background(), filepath.Join(dir, "forge.db"))
@@ -130,7 +130,7 @@ func openAPI(t *testing.T, src *fakeSource) (*store.Store, *stream.Stream, strin
 	t.Cleanup(srv.Close)
 	id, tok := enrollWorker(t, st)
 	c := &Client{BaseURL: srv.URL, Token: tok, WorkerID: id, HTTP: srv.Client()}
-	return st, jobs, logDir, c, src
+	return st, jobs, logDir, c, src, h
 }
 
 func putQueued(t *testing.T, st *store.Store, jobs *stream.Stream, j *job.Job) {
@@ -144,7 +144,7 @@ func putQueued(t *testing.T, st *store.Store, jobs *stream.Stream, j *job.Job) {
 }
 
 func TestClaimUnauthorized(t *testing.T) {
-	_, _, _, c, _ := openAPI(t, nil)
+	_, _, _, c, _, _ := openAPI(t, nil)
 	req, _ := http.NewRequest(http.MethodGet, c.BaseURL+"/v1/agents/"+c.WorkerID+"/claim", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -157,7 +157,7 @@ func TestClaimUnauthorized(t *testing.T) {
 }
 
 func TestClaimWrongWorkerID(t *testing.T) {
-	_, _, _, c, _ := openAPI(t, nil)
+	_, _, _, c, _, _ := openAPI(t, nil)
 	c.WorkerID = "not-me"
 	_, err := c.Claim(context.Background())
 	if err == nil {
@@ -166,7 +166,7 @@ func TestClaimWrongWorkerID(t *testing.T) {
 }
 
 func TestClaimRemovedWorker(t *testing.T) {
-	st, _, _, c, _ := openAPI(t, nil)
+	st, _, _, c, _, _ := openAPI(t, nil)
 	if err := st.SetWorkerState(context.Background(), c.WorkerID, job.WorkerRemoved); err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestClaimRemovedWorker(t *testing.T) {
 }
 
 func TestClaimCordonedWorker(t *testing.T) {
-	st, _, _, c, _ := openAPI(t, nil)
+	st, _, _, c, _, _ := openAPI(t, nil)
 	if err := st.SetWorkerState(context.Background(), c.WorkerID, job.WorkerCordoned); err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestClaimCordonedWorker(t *testing.T) {
 }
 
 func TestEnrollHTTP(t *testing.T) {
-	st, _, _, c, _ := openAPI(t, nil)
+	st, _, _, c, _, _ := openAPI(t, nil)
 	tok, err := st.IssueEnrollmentToken(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -221,7 +221,7 @@ func TestEnrollHTTP(t *testing.T) {
 }
 
 func TestEnrollRejectsUnknownToken(t *testing.T) {
-	_, _, _, c, _ := openAPI(t, nil)
+	_, _, _, c, _, _ := openAPI(t, nil)
 	anon := &Client{BaseURL: c.BaseURL, HTTP: c.HTTP}
 	_, err := anon.Enroll(context.Background(), "nope", "h", "amd64", "test")
 	if err == nil {
@@ -230,7 +230,7 @@ func TestEnrollRejectsUnknownToken(t *testing.T) {
 }
 
 func TestClaimAssignsAndReturnsJIT(t *testing.T) {
-	st, jobs, _, c, _ := openAPI(t, nil)
+	st, jobs, _, c, _, _ := openAPI(t, nil)
 	putQueued(t, st, jobs, testJob("job-1", 1))
 	got, err := c.Claim(context.Background())
 	if err != nil {
@@ -252,7 +252,7 @@ func TestClaimAssignsAndReturnsJIT(t *testing.T) {
 }
 
 func TestClaimTimeoutNoJob(t *testing.T) {
-	_, _, _, c, _ := openAPI(t, nil)
+	_, _, _, c, _, _ := openAPI(t, nil)
 	_, err := c.Claim(context.Background())
 	if err != ErrNoJob {
 		t.Fatalf("err = %v, want ErrNoJob", err)
@@ -261,7 +261,7 @@ func TestClaimTimeoutNoJob(t *testing.T) {
 
 func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 	src := &fakeSource{registerErr: fmt.Errorf("github down")}
-	st, jobs, _, c, src := openAPI(t, src)
+	st, jobs, _, c, src, _ := openAPI(t, src)
 	putQueued(t, st, jobs, testJob("job-jit", 2))
 	_, err := c.Claim(context.Background())
 	if err != ErrNoJob {
@@ -280,7 +280,7 @@ func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 }
 
 func TestStatusRunningSucceededAndLogs(t *testing.T) {
-	st, jobs, logDir, c, src := openAPI(t, nil)
+	st, jobs, logDir, c, src, _ := openAPI(t, nil)
 	putQueued(t, st, jobs, testJob("job-ok", 3))
 	cl, err := c.Claim(context.Background())
 	if err != nil {
@@ -315,7 +315,7 @@ func TestStatusRunningSucceededAndLogs(t *testing.T) {
 }
 
 func TestFailedFromAssignedUnregisters(t *testing.T) {
-	st, jobs, _, c, src := openAPI(t, nil)
+	st, jobs, _, c, src, _ := openAPI(t, nil)
 	putQueued(t, st, jobs, testJob("job-start", 4))
 	cl, err := c.Claim(context.Background())
 	if err != nil {
@@ -337,7 +337,7 @@ func TestFailedFromAssignedUnregisters(t *testing.T) {
 }
 
 func TestStaleAttemptRejected(t *testing.T) {
-	st, jobs, _, c, _ := openAPI(t, nil)
+	st, jobs, _, c, _, _ := openAPI(t, nil)
 	putQueued(t, st, jobs, testJob("job-stale", 5))
 	cl, err := c.Claim(context.Background())
 	if err != nil {
@@ -350,7 +350,7 @@ func TestStaleAttemptRejected(t *testing.T) {
 }
 
 func TestStatusWrongWorker(t *testing.T) {
-	st, jobs, _, c, _ := openAPI(t, nil)
+	st, jobs, _, c, _, _ := openAPI(t, nil)
 	putQueued(t, st, jobs, testJob("job-fence", 6))
 	cl, err := c.Claim(context.Background())
 	if err != nil {
@@ -361,5 +361,164 @@ func TestStatusWrongWorker(t *testing.T) {
 	err = other.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobRunning})
 	if err == nil {
 		t.Fatal("expected error for other worker")
+	}
+}
+
+func TestHeartbeatRestoresLost(t *testing.T) {
+	st, _, _, c, _, _ := openAPI(t, nil)
+	ctx := context.Background()
+	if err := st.SetWorkerState(ctx, c.WorkerID, job.WorkerLost); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Heartbeat(ctx, Heartbeat{Capacity: 1, Healthy: true}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	w, err := st.GetWorker(ctx, c.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.State != job.WorkerActive || !w.Healthy || w.Capacity != 1 {
+		t.Fatalf("worker = %+v", w)
+	}
+}
+
+func TestHeartbeatUnauthorized(t *testing.T) {
+	_, _, _, c, _, _ := openAPI(t, nil)
+	req, _ := http.NewRequest(http.MethodPost, c.BaseURL+"/v1/agents/"+c.WorkerID+"/heartbeat", bytes.NewReader([]byte(`{"capacity":1,"healthy":true}`)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestClaimUnhealthyNoJob(t *testing.T) {
+	_, _, _, c, _, _ := openAPI(t, nil)
+	if err := c.Heartbeat(context.Background(), Heartbeat{Capacity: 1, Healthy: false}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.Claim(context.Background())
+	if err != ErrNoJob {
+		t.Fatalf("err = %v, want ErrNoJob", err)
+	}
+}
+
+func TestSweepMarksStaleWorkerLost(t *testing.T) {
+	st, _, _, c, _, h := openAPI(t, nil)
+	ctx := context.Background()
+	if err := st.SetLastSeen(ctx, c.WorkerID, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	h.LostAfter = 30 * time.Second
+	if err := h.Sweep(ctx); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	w, err := st.GetWorker(ctx, c.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.State != job.WorkerLost {
+		t.Fatalf("state = %s, want lost", w.State)
+	}
+}
+
+func TestSweepRequeuesAssigned(t *testing.T) {
+	st, jobs, _, c, src, h := openAPI(t, nil)
+	h.Visibility = time.Millisecond
+	putQueued(t, st, jobs, testJob("job-reclaim", 7))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := h.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	row, err := st.GetJob(context.Background(), cl.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobQueued || row.Attempt != 1 || row.WorkerID != "" {
+		t.Fatalf("job = %+v", row)
+	}
+	if ids := src.unregisterIDs(); len(ids) != 1 || ids[0] != 1 {
+		t.Errorf("Unregister = %v, want [1]", ids)
+	}
+	cl2, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("second Claim: %v", err)
+	}
+	if cl2.Attempt != 2 {
+		t.Fatalf("attempt = %d, want 2", cl2.Attempt)
+	}
+}
+
+func TestSweepDeadLettersAfterMaxAttempts(t *testing.T) {
+	st, jobs, _, c, _, h := openAPI(t, nil)
+	h.Visibility = time.Millisecond
+	h.MaxAttempts = 1
+	putQueued(t, st, jobs, testJob("job-dl", 8))
+	if _, err := c.Claim(context.Background()); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := h.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	row, err := st.GetJob(context.Background(), "job-dl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobFailed || !row.DeadLettered || row.Reason != "max_attempts" {
+		t.Fatalf("job = %+v", row)
+	}
+}
+
+func TestSweepFailsRunningAsWorkerLost(t *testing.T) {
+	st, jobs, _, c, src, h := openAPI(t, nil)
+	h.Visibility = time.Millisecond
+	putQueued(t, st, jobs, testJob("job-run", 9))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobRunning}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := h.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	row, err := st.GetJob(context.Background(), cl.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobFailed || row.Reason != "worker_lost" || row.DeadLettered {
+		t.Fatalf("job = %+v", row)
+	}
+	if ids := src.unregisterIDs(); len(ids) != 0 {
+		t.Errorf("Unregister = %v, want none after running", ids)
+	}
+}
+
+func TestSweepLeavesFreshClaim(t *testing.T) {
+	st, jobs, _, c, _, h := openAPI(t, nil)
+	h.Visibility = time.Minute
+	putQueued(t, st, jobs, testJob("job-fresh", 10))
+	if _, err := c.Claim(context.Background()); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := h.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	row, err := st.GetJob(context.Background(), "job-fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobAssigned {
+		t.Fatalf("state = %s, want assigned", row.State)
 	}
 }
