@@ -6,7 +6,7 @@
 -- "a milestone's new tables or columns ship as a migration."
 
 CREATE TABLE jobs (
-    id            TEXT PRIMARY KEY,          -- ULID
+    id            TEXT PRIMARY KEY,          -- random 128-bit hex
     source        TEXT NOT NULL,             -- 'github'
     external_id   INTEGER NOT NULL,
     repo          TEXT NOT NULL,

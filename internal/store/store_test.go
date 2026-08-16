@@ -39,8 +39,33 @@ func TestOpenAppliesMigration(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil {
 		t.Fatalf("read schema_version: %v", err)
 	}
-	if version != 3 {
-		t.Errorf("schema_version = %d, want 3", version)
+	if version != 4 {
+		t.Errorf("schema_version = %d, want 4", version)
+	}
+}
+
+func TestTakeRunnerID(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	j := &job.Job{ID: "job-rid", Source: "github", ExternalID: 70, Repo: "o/r", RunID: 1, State: job.JobQueued}
+	if err := s.CreateJob(ctx, j); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Assign(ctx, "job-rid", "w1", 7); err != nil {
+		t.Fatal(err)
+	}
+	id, ok, err := s.TakeRunnerID(ctx, "job-rid")
+	if err != nil || !ok || id != 7 {
+		t.Fatalf("TakeRunnerID = %d %v %v, want 7 true nil", id, ok, err)
+	}
+	// Cleared after the first take.
+	id, ok, err = s.TakeRunnerID(ctx, "job-rid")
+	if err != nil || ok || id != 0 {
+		t.Fatalf("second TakeRunnerID = %d %v %v, want 0 false nil", id, ok, err)
+	}
+	// Missing job is not an error; there is simply nothing to take.
+	if _, ok, err := s.TakeRunnerID(ctx, "job-none"); err != nil || ok {
+		t.Fatalf("missing job TakeRunnerID ok=%v err=%v", ok, err)
 	}
 }
 
@@ -188,7 +213,7 @@ func TestAssignIncrementsAttemptAndSetsWorker(t *testing.T) {
 	if err := s.CreateJob(ctx, testJob("job-1")); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	got, err := s.Assign(ctx, "job-1", "worker-1")
+	got, err := s.Assign(ctx, "job-1", "worker-1", 1)
 	if err != nil {
 		t.Fatalf("Assign: %v", err)
 	}
@@ -202,7 +227,7 @@ func TestAssignIncrementsAttemptAndSetsWorker(t *testing.T) {
 		t.Errorf("WorkerID = %q, want worker-1", got.WorkerID)
 	}
 
-	if _, err := s.Assign(ctx, "job-1", "worker-2"); err == nil {
+	if _, err := s.Assign(ctx, "job-1", "worker-2", 1); err == nil {
 		t.Fatal("expected error assigning a non-queued job")
 	}
 }
@@ -218,7 +243,7 @@ func TestQueuedIDs(t *testing.T) {
 	if err := s.CreateJob(ctx, j2); err != nil {
 		t.Fatalf("CreateJob job-2: %v", err)
 	}
-	if _, err := s.Assign(ctx, "job-2", "w1"); err != nil {
+	if _, err := s.Assign(ctx, "job-2", "w1", 1); err != nil {
 		t.Fatalf("Assign: %v", err)
 	}
 	ids, err := s.QueuedIDs(ctx)
@@ -241,7 +266,7 @@ func TestListJobsCountQueuedAndTransitions(t *testing.T) {
 	if err := s.CreateJob(ctx, j2); err != nil {
 		t.Fatalf("CreateJob job-2: %v", err)
 	}
-	if _, err := s.Assign(ctx, "job-2", "w1"); err != nil {
+	if _, err := s.Assign(ctx, "job-2", "w1", 1); err != nil {
 		t.Fatalf("Assign: %v", err)
 	}
 

@@ -14,6 +14,8 @@ func TestValidateWorkerTransition(t *testing.T) {
 		{WorkerDraining, WorkerCordoned}: true,
 		{WorkerDraining, WorkerLost}:     true,
 		{WorkerLost, WorkerActive}:       true,
+		{WorkerLost, WorkerCordoned}:     true,
+		{WorkerLost, WorkerDraining}:     true,
 		{WorkerLost, WorkerRemoved}:      true,
 	}
 	states := []WorkerState{

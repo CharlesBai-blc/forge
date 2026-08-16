@@ -241,7 +241,9 @@ func randomHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// Heartbeat records liveness. A lost worker becomes active (FR-20).
+// Heartbeat records liveness. A lost worker returns to the state it
+// held before going lost, preserving cordon and drain intent (FR-19,
+// FR-20, tdd.md §4.3).
 func (s *Store) Heartbeat(ctx context.Context, id string, capacity int, healthy bool) error {
 	w, err := s.GetWorker(ctx, id)
 	if err != nil {
@@ -252,10 +254,18 @@ func (s *Store) Heartbeat(ctx context.Context, id string, capacity int, healthy 
 	}
 	state := w.State
 	if state == job.WorkerLost {
-		if err := job.ValidateWorkerTransition(state, job.WorkerActive); err != nil {
+		revive := job.WorkerActive
+		var prev sql.NullString
+		if err := s.db.QueryRowContext(ctx, `SELECT prev_state FROM workers WHERE id = ?`, id).Scan(&prev); err != nil {
+			return fmt.Errorf("store: heartbeat prev_state: %w", err)
+		}
+		if prev.Valid && prev.String != "" {
+			revive = job.WorkerState(prev.String)
+		}
+		if err := job.ValidateWorkerTransition(state, revive); err != nil {
 			return err
 		}
-		state = job.WorkerActive
+		state = revive
 	}
 	now := formatTime(time.Now().UTC())
 	_, err = s.db.ExecContext(ctx, `
@@ -267,9 +277,22 @@ func (s *Store) Heartbeat(ctx context.Context, id string, capacity int, healthy 
 	return nil
 }
 
-// MarkLost sets a worker lost after missed heartbeats (FR-20).
+// MarkLost sets a worker lost after missed heartbeats, recording the
+// state it held so a resumed heartbeat can restore it (FR-19, FR-20).
 func (s *Store) MarkLost(ctx context.Context, id string) error {
-	return s.TransitionWorker(ctx, id, job.WorkerLost)
+	w, err := s.GetWorker(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := job.ValidateWorkerTransition(w.State, job.WorkerLost); err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE workers SET state = ?, prev_state = ? WHERE id = ?`,
+		string(job.WorkerLost), string(w.State), id)
+	if err != nil {
+		return fmt.Errorf("store: mark lost: %w", err)
+	}
+	return nil
 }
 
 // ListWorkers returns every enrolled worker.

@@ -127,9 +127,23 @@ func (c *Client) Status(ctx context.Context, jobID string, attempt int, rep Stat
 	return nil
 }
 
-// Logs uploads sandbox stdout/stderr for an attempt.
+// Logs uploads a full log snapshot for an attempt, replacing any
+// previously uploaded content.
 func (c *Client) Logs(ctx context.Context, jobID string, attempt int, r io.Reader) error {
+	return c.logs(ctx, jobID, attempt, r, false)
+}
+
+// AppendLogs uploads one log chunk while the attempt runs (FR-24).
+// Chunks are appended in call order.
+func (c *Client) AppendLogs(ctx context.Context, jobID string, attempt int, r io.Reader) error {
+	return c.logs(ctx, jobID, attempt, r, true)
+}
+
+func (c *Client) logs(ctx context.Context, jobID string, attempt int, r io.Reader, appendChunk bool) error {
 	path := "/v1/jobs/" + jobID + "/attempts/" + strconv.Itoa(attempt) + "/logs"
+	if appendChunk {
+		path += "?append=1"
+	}
 	resp, err := c.do(ctx, http.MethodPost, path, r, "application/octet-stream")
 	if err != nil {
 		return err

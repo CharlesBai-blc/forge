@@ -29,6 +29,7 @@ import (
 	"github.com/CharlesBai-blc/forge/internal/secret"
 	"github.com/CharlesBai-blc/forge/internal/source/github"
 	"github.com/CharlesBai-blc/forge/internal/store"
+	"github.com/CharlesBai-blc/forge/internal/stream"
 )
 
 const testSecret = "test-secret"
@@ -243,6 +244,96 @@ func TestStartupReconcilesQueued(t *testing.T) {
 	}
 	if cl.JobID != "job-r" || cl.JIT != "jit-blob" {
 		t.Fatalf("claim = %+v", cl)
+	}
+}
+
+func TestWebhookDuplicateDeliveryIdempotent(t *testing.T) {
+	ctx := context.Background()
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/generate-jitconfig") {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"runner":{"id":1},"encoded_jit_config":"jit-blob"}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(gh.Close)
+	src := &github.Source{
+		Secret:  testSecret,
+		Token:   "tok",
+		Owner:   "owner",
+		Repo:    "name",
+		BaseURL: gh.URL,
+		Client:  gh.Client(),
+	}
+	mr := miniredis.RunT(t)
+	cfg := config{
+		dataDir:       t.TempDir(),
+		webhookSecret: testSecret,
+		githubToken:   "tok",
+		githubOwner:   "owner",
+		githubRepo:    "name",
+		image:         "alpine:3.20",
+		redis:         mr.Addr(),
+	}
+	a, err := newApp(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), src)
+	if err != nil {
+		t.Fatalf("newApp: %v", err)
+	}
+	t.Cleanup(func() { a.Close() })
+	a.api.ClaimWait = 50 * time.Millisecond
+	srv := httptest.NewServer(a.mux)
+	t.Cleanup(srv.Close)
+
+	body := queuedBody()
+	deliver := func() int {
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/webhook/github", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-GitHub-Event", "workflow_job")
+		req.Header.Set("X-Hub-Signature-256", sign(body))
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if code := deliver(); code != http.StatusAccepted {
+		t.Fatalf("first delivery = %d, want 202", code)
+	}
+	if code := deliver(); code != http.StatusAccepted {
+		t.Fatalf("redelivery = %d, want 202", code)
+	}
+	row, err := a.store.GetJobBySource(ctx, "github", 11)
+	if err != nil {
+		t.Fatalf("GetJobBySource: %v", err)
+	}
+	if row.State != job.JobQueued {
+		t.Fatalf("state = %s, want queued", row.State)
+	}
+
+	// Wipe Redis to simulate a lost stream entry, recreate the consumer
+	// group, then redeliver: the entry must be repaired.
+	mr.FlushAll()
+	s2, err := stream.Open(ctx, mr.Addr())
+	if err != nil {
+		t.Fatalf("stream.Open: %v", err)
+	}
+	s2.Close()
+	if code := deliver(); code != http.StatusAccepted {
+		t.Fatalf("repair delivery = %d, want 202", code)
+	}
+	id, tok := enrollWorker(t, a.store)
+	c := &api.Client{BaseURL: srv.URL, Token: tok, WorkerID: id, HTTP: srv.Client()}
+	cl, err := c.Claim(ctx)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if cl.JobID != row.ID {
+		t.Fatalf("claimed %s, want %s", cl.JobID, row.ID)
 	}
 }
 

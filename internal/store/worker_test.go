@@ -144,6 +144,28 @@ func TestHeartbeatUpdatesAndRestoresLost(t *testing.T) {
 	}
 }
 
+func TestHeartbeatRestoresCordonedAfterLost(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	id, _ := enrollTest(t, s)
+	if err := s.TransitionWorker(ctx, id, job.WorkerCordoned); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkLost(ctx, id); err != nil {
+		t.Fatalf("MarkLost: %v", err)
+	}
+	if err := s.Heartbeat(ctx, id, 1, true); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	w, err := s.GetWorker(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.State != job.WorkerCordoned {
+		t.Fatalf("state = %s, want cordoned restored after lost", w.State)
+	}
+}
+
 func TestMarkLostRejectsRemoved(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()
@@ -165,7 +187,7 @@ func TestRequeueAndDeadLetter(t *testing.T) {
 	if err := s.CreateJob(ctx, testJob("job-r")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Assign(ctx, "job-r", "w1"); err != nil {
+	if _, err := s.Assign(ctx, "job-r", "w1", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Transition(ctx, "job-r", job.JobLost, "visibility_timeout"); err != nil {
@@ -182,7 +204,7 @@ func TestRequeueAndDeadLetter(t *testing.T) {
 		t.Fatalf("requeued = %+v", got)
 	}
 
-	if _, err := s.Assign(ctx, "job-r", "w2"); err != nil {
+	if _, err := s.Assign(ctx, "job-r", "w2", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Transition(ctx, "job-r", job.JobLost, "visibility_timeout"); err != nil {
@@ -206,7 +228,7 @@ func TestDrainRequeueDoesNotConsumeAttempt(t *testing.T) {
 	if err := s.CreateJob(ctx, testJob("job-d")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Assign(ctx, "job-d", "w1"); err != nil {
+	if _, err := s.Assign(ctx, "job-d", "w1", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.DrainRequeue(ctx, "job-d"); err != nil {
@@ -219,7 +241,7 @@ func TestDrainRequeueDoesNotConsumeAttempt(t *testing.T) {
 	if got.State != job.JobQueued || got.WorkerID != "" || got.Attempt != 0 || got.Reason != "drain" {
 		t.Fatalf("drained = %+v", got)
 	}
-	assigned, err := s.Assign(ctx, "job-d", "w2")
+	assigned, err := s.Assign(ctx, "job-d", "w2", 1)
 	if err != nil {
 		t.Fatal(err)
 	}

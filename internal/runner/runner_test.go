@@ -54,7 +54,7 @@ func (s *fakeSandbox) Wait(context.Context) (int, error) {
 	return s.exitCode, s.waitErr
 }
 
-func (s *fakeSandbox) Logs(context.Context) (io.ReadCloser, error) {
+func (s *fakeSandbox) Logs(context.Context, bool) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader(s.logs)), nil
 }
 
@@ -305,9 +305,14 @@ func TestCreateErrorFailsJob(t *testing.T) {
 		t.Fatalf("Add: %v", err)
 	}
 
-	waitState(t, st, j.ID, job.JobFailed)
-	if ids := src.unregisterIDs(); len(ids) != 1 || ids[0] != 1 {
-		t.Errorf("Unregister = %v, want [1]", ids)
+	// Attempt 1 requeues (pre-acquisition sandbox error), attempt 2
+	// dead-letters at the default max of 2.
+	got := waitState(t, st, j.ID, job.JobFailed)
+	if !got.DeadLettered || got.Attempt != 2 {
+		t.Errorf("job = %+v, want dead-lettered on attempt 2", got)
+	}
+	if ids := src.unregisterIDs(); len(ids) != 2 {
+		t.Errorf("Unregister = %v, want one per attempt", ids)
 	}
 }
 
@@ -324,10 +329,12 @@ func TestStartErrorDestroysAndFails(t *testing.T) {
 		t.Fatalf("Add: %v", err)
 	}
 
+	// Both attempts fail at Start, destroy their sandbox, and the job
+	// dead-letters on the second.
 	waitState(t, st, j.ID, job.JobFailed)
-	waitDestroyed(t, p.sb, 1)
-	if ids := src.unregisterIDs(); len(ids) != 1 || ids[0] != 1 {
-		t.Errorf("Unregister = %v, want [1]", ids)
+	waitDestroyed(t, p.sb, 2)
+	if ids := src.unregisterIDs(); len(ids) != 2 {
+		t.Errorf("Unregister = %v, want one per attempt", ids)
 	}
 }
 
@@ -385,6 +392,87 @@ func TestRunWritesLogs(t *testing.T) {
 	}
 	if string(b) != "hello-forge\n" {
 		t.Errorf("log = %q, want hello-forge\\n", b)
+	}
+}
+
+// liveSandbox emits follow-mode logs through a pipe and blocks Wait
+// until the test releases it, simulating a long-running job.
+type liveSandbox struct {
+	fakeSandbox
+	pr     *io.PipeReader
+	waitCh chan int
+}
+
+func (s *liveSandbox) Logs(_ context.Context, follow bool) (io.ReadCloser, error) {
+	if follow {
+		return s.pr, nil
+	}
+	return io.NopCloser(strings.NewReader(s.logs)), nil
+}
+
+func (s *liveSandbox) Wait(ctx context.Context) (int, error) {
+	select {
+	case code := <-s.waitCh:
+		return code, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+type liveProvider struct{ sb sandbox.Sandbox }
+
+func (p *liveProvider) Create(context.Context, sandbox.Spec) (sandbox.Sandbox, error) {
+	return p.sb, nil
+}
+
+func TestRunStreamsLogsWhileRunning(t *testing.T) {
+	pr, pw := io.Pipe()
+	sb := &liveSandbox{fakeSandbox: fakeSandbox{id: "sb-live"}, pr: pr, waitCh: make(chan int)}
+	p := &liveProvider{sb: sb}
+	st, jobs, r, _, logDir := openHarness(t, p)
+	startRunner(t, r)
+
+	j := testJob("job-live", 9)
+	if err := st.CreateJob(context.Background(), j); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if err := jobs.Add(context.Background(), j.ID); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	waitState(t, st, j.ID, job.JobRunning)
+
+	if _, err := pw.Write([]byte("tick-1\n")); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(logDir, "job-live-1.log")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if b, err := os.ReadFile(logPath); err == nil && strings.Contains(string(b), "tick-1") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("log chunk did not reach the control plane while the job was running")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got, err := st.GetJob(context.Background(), j.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.JobRunning {
+		t.Fatalf("state = %s, want still running while logs stream", got.State)
+	}
+
+	pw.Close()
+	sb.logs = "tick-1\n"
+	sb.waitCh <- 0
+	waitState(t, st, j.ID, job.JobSucceeded)
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "tick-1\n" {
+		t.Errorf("final log = %q, want tick-1 only (no duplicate snapshot)", b)
 	}
 }
 
@@ -454,7 +542,7 @@ func TestStatusReplayFromOutbox(t *testing.T) {
 	if err := st.CreateJob(context.Background(), j); err != nil {
 		t.Fatal(err)
 	}
-	assigned, err := st.Assign(context.Background(), j.ID, r.Client.WorkerID)
+	assigned, err := st.Assign(context.Background(), j.ID, r.Client.WorkerID, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -37,7 +37,9 @@ type Sandbox interface {
 	Wait(ctx context.Context) (int, error)
 
 	// Logs streams combined stdout and stderr from process start.
-	Logs(ctx context.Context) (io.ReadCloser, error)
+	// With follow set, the stream stays open and delivers output as it
+	// is produced until the process exits (FR-24).
+	Logs(ctx context.Context, follow bool) (io.ReadCloser, error)
 
 	// Destroy force-removes the sandbox and its writable layer.
 	// Idempotent. No Reset or Release (FR-13).

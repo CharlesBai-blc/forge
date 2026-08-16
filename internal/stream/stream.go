@@ -120,6 +120,22 @@ func (s *Stream) Ack(ctx context.Context, msgID string) error {
 	return nil
 }
 
+// Extend returns msgID to consumer's PEL and resets its idle time, so a
+// live worker's in-flight job survives the visibility timeout (FR-11).
+func (s *Stream) Extend(ctx context.Context, msgID, consumer string) error {
+	err := s.rdb.XClaimJustID(ctx, &redis.XClaimArgs{
+		Stream:   name,
+		Group:    group,
+		Consumer: consumer,
+		MinIdle:  0,
+		Messages: []string{msgID},
+	}).Err()
+	if err != nil && err != redis.Nil {
+		return fmt.Errorf("stream: xclaim %s: %w", msgID, err)
+	}
+	return nil
+}
+
 // Has reports whether jobID already appears in the stream.
 func (s *Stream) Has(ctx context.Context, jobID string) (bool, error) {
 	msgs, err := s.rdb.XRange(ctx, name, "-", "+").Result()
@@ -162,13 +178,23 @@ func (s *Stream) AutoClaim(ctx context.Context, minIdle time.Duration) ([]Messag
 
 // PendingFor returns PEL entries held by workerID.
 func (s *Stream) PendingFor(ctx context.Context, workerID string) ([]Message, error) {
+	return s.pending(ctx, workerID)
+}
+
+// PendingAll returns every PEL entry in the group regardless of
+// consumer, including entries the sweeper has auto-claimed.
+func (s *Stream) PendingAll(ctx context.Context) ([]Message, error) {
+	return s.pending(ctx, "")
+}
+
+func (s *Stream) pending(ctx context.Context, consumer string) ([]Message, error) {
 	pending, err := s.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
 		Stream:   name,
 		Group:    group,
 		Start:    "-",
 		End:      "+",
 		Count:    100,
-		Consumer: workerID,
+		Consumer: consumer,
 	}).Result()
 	if err != nil {
 		return nil, fmt.Errorf("stream: xpending: %w", err)

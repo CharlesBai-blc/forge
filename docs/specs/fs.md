@@ -1,6 +1,6 @@
 # Forge - Functional Specification
 
-**Version:** 1.2 | **Date:** August 14, 2026 | **Owner:** Charles Bai
+**Version:** 1.3 | **Date:** August 16, 2026 | **Owner:** Charles Bai
 **Scope authority:** Project Charter v1.0.
 **Companion doc:** Technical Design Document (architecture, data model, API surface). This document defines what Forge does. The TDD defines how.
 
@@ -57,12 +57,12 @@ Requirements are numbered for traceability. Tests and PRs reference them. [Mx] m
 - **FR-9 [M1]** Jobs progress through explicit states: queued, assigned, running, then succeeded, failed, or lost. State history is persisted and queryable.
 - **FR-10 [M3]** Jobs queue durably; workers claim them per FR-11's delivery guarantees. At M1 an embedded in-process queue is acceptable. Whether a queue mechanism is required for every install is an open question (§7) resolved in the TDD.
 - **FR-11 [M3]** Delivery is at-least-once with idempotent claiming. A job assigned to a dead worker is reclaimed after a visibility timeout and re-dispatched. A job is never executed by two workers concurrently.
-- **FR-12 [M3]** A job that fails N times (default 2) moves to a dead-letter state, visible on the dashboard with logs, and reports to GitHub as failed.
+- **FR-12 [M3]** A job that fails N times (default 2) moves to a dead-letter state, visible on the dashboard with its logs and full attempt history. GitHub-side reporting follows the runner-acquisition model (TDD §6.1): a job whose runner acquired it fails in GitHub's UI when that runner disappears. A dead-lettered job whose attempts never acquired the GitHub job remains queued on GitHub until GitHub's own timeout, because GitHub has no API to fail a queued workflow job and cancelling the run would cancel sibling jobs in the same run. The dashboard is authoritative for dead-letter state.
 
 ### 3.4 Sandbox and isolation (Sandbox: `docker`)
 
 - **FR-13 [M1, hardened M4]** Every job runs in a freshly created Docker container from a configured base image. The container and its writable layer are destroyed after exactly one job. No code path permits sandbox reuse.
-- **FR-14 [M1]** Sandboxes run with configurable resource limits (CPU, memory, PIDs, disk) and safe defaults.
+- **FR-14 [M1]** Sandboxes run with configurable resource limits (CPU, memory, PIDs, disk) and safe defaults. CPU, memory, and PID limits are enforced by the docker sandbox. Disk limits depend on the Docker storage driver and are enforced at M4 with the hardened profile (FR-15).
 - **FR-15 [M4]** Hardened default profile: no host network, no privileged mode, read-only host mounts, non-root user, documented seccomp and capabilities baseline.
 - **FR-16 [M4]** Warm pool: workers pre-create N ready sandboxes per label. A queued job attaches to a warm sandbox when available. Pool size is configurable. Warm sandboxes remain single-use.
 - **FR-17 [M4]** An isolation test suite proves: no cross-job file persistence, no visibility into other containers, resource limits enforced. Runs in CI. The README security section references its pass state.
@@ -108,7 +108,7 @@ GitLab, Gitea, and Bitbucket sources. Firecracker and gVisor sandboxes (planned 
 
 - **M1:** Push to a test repo triggers a job in a fresh container on one machine. Pass/fail visible in Forge logs. Test verifies the container is destroyed.
 - **M2:** Interim path deleted. JIT runner registered per job. Results appear in GitHub's UI. FR-27 credential handling in place.
-- **M3:** Two or more machines enrolled via bootstrap command. Durable multi-worker queue in place. Killing a worker mid-job results in reclamation and completion elsewhere. Drain works. Basic dashboard.
+- **M3:** Two or more machines enrolled via bootstrap command. Durable multi-worker queue in place. Killing a worker mid-job results in reclamation: an attempt that has not yet acquired the GitHub job is re-dispatched and completes elsewhere; an attempt killed after acquisition is terminally failed, because GitHub binds an acquired job to one runner (TDD §6.1). Drain works. Basic dashboard.
 - **M4:** Warm pool meets NFR-1. Isolation suite (FR-17) and chaos suite (NFR-3) pass in CI. Threat model published.
 - **M5:** Flooding the queue triggers burst instances that absorb load, drain, and terminate within caps. Benchmark meets NFR-2. Forge runs its own CI. v1.0 tagged.
 
@@ -124,4 +124,4 @@ GitLab, Gitea, and Bitbucket sources. Firecracker and gVisor sandboxes (planned 
 
 PRs reference the FR and NFR IDs they implement or test. README claims link to the requirement and the test or benchmark backing them. This file changes only through versioned revision with a log entry.
 
-*Revision log:* v1.0 initial. v1.1 style cleanup, no scope changes. v1.2 replaced implementation-specific wording in FR-2, FR-6, FR-8, FR-10, FR-25, NFR-7, and the M3 acceptance criterion with behavior-level requirements, and resolved the FR-10/§7 open-question conflict. No end-behavior changes.
+*Revision log:* v1.0 initial. v1.1 style cleanup, no scope changes. v1.2 replaced implementation-specific wording in FR-2, FR-6, FR-8, FR-10, FR-25, NFR-7, and the M3 acceptance criterion with behavior-level requirements, and resolved the FR-10/§7 open-question conflict. No end-behavior changes. v1.3 aligned FR-12 GitHub-side reporting and the M3 acceptance criterion with GitHub's runner-acquisition model already documented in TDD §6.1, and stated disk-limit enforcement timing in FR-14. Rationale: GitHub provides no API to fail a queued workflow job, and re-dispatch after acquisition would re-run user code against a job GitHub already failed. No queue or sandbox behavior changes.

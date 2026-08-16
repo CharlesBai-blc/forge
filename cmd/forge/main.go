@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,6 +36,9 @@ type config struct {
 	image         string
 	command       []string
 	redis         string
+	cpu           float64
+	memoryMB      int64
+	pids          int64
 }
 
 func main() {
@@ -68,6 +72,9 @@ func parseFlags() config {
 	image := flag.String("image", envOr("FORGE_JOB_IMAGE", ""), "sandbox image")
 	command := flag.String("command", envOr("FORGE_JOB_COMMAND", ""), "sandbox command; default is actions/runner JIT")
 	redisAddr := flag.String("redis", envOr("FORGE_REDIS", "127.0.0.1:6379"), "redis address")
+	cpu := flag.Float64("cpu", envOrFloat("FORGE_JOB_CPU", defaultCPU), "sandbox CPU limit in cores; 0 disables (FR-14)")
+	memoryMB := flag.Int64("memory-mb", envOrInt("FORGE_JOB_MEMORY_MB", defaultMemoryMB), "sandbox memory limit in MiB; 0 disables (FR-14)")
+	pids := flag.Int64("pids", envOrInt("FORGE_JOB_PIDS", defaultPIDs), "sandbox PID limit; 0 disables (FR-14)")
 	flag.Parse()
 	return config{
 		addr:          *addr,
@@ -80,14 +87,48 @@ func parseFlags() config {
 		image:         *image,
 		command:       strings.Fields(*command),
 		redis:         *redisAddr,
+		cpu:           *cpu,
+		memoryMB:      *memoryMB,
+		pids:          *pids,
 	}
 }
+
+// Sandbox resource defaults (FR-14, tdd.md Appendix B).
+const (
+	defaultCPU      = 2.0
+	defaultMemoryMB = 4096
+	defaultPIDs     = 4096
+)
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return fallback
+}
+
+func envOrFloat(key string, fallback float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return fallback
+	}
+	return f
+}
+
+func envOrInt(key string, fallback int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return n
 }
 
 // jobCommand is the sandbox process. Empty means the official
@@ -219,7 +260,28 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.Runner
 	h := &webhookHandler{
 		src: src,
 		onJob: func(j *job.Job) error {
-			if err := st.CreateJob(ctx, j); err != nil {
+			err := st.CreateJob(ctx, j)
+			if errors.Is(err, store.ErrDuplicateJob) {
+				// Webhook redelivery. Repair a still-queued job whose
+				// stream entry is missing, then report success so GitHub
+				// stops retrying.
+				existing, gerr := st.GetJobBySource(ctx, j.Source, j.ExternalID)
+				if gerr != nil {
+					return gerr
+				}
+				if existing.State != job.JobQueued {
+					return nil
+				}
+				ok, herr := jobs.Has(ctx, existing.ID)
+				if herr != nil {
+					return herr
+				}
+				if ok {
+					return nil
+				}
+				return jobs.Add(ctx, existing.ID)
+			}
+			if err != nil {
 				return err
 			}
 			return jobs.Add(ctx, j.ID)
@@ -228,13 +290,16 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.Runner
 	mux := http.NewServeMux()
 	mux.Handle("/webhook/github", h)
 	apiH := &api.Handler{
-		Stream:  jobs,
-		Store:   st,
-		Source:  src,
-		Image:   cfg.image,
-		Command: jobCommand(cfg.command),
-		LogDir:  filepath.Join(cfg.dataDir, "logs"),
-		Log:     log,
+		Stream:      jobs,
+		Store:       st,
+		Source:      src,
+		Image:       cfg.image,
+		Command:     jobCommand(cfg.command),
+		CPU:         cfg.cpu,
+		MemoryBytes: cfg.memoryMB << 20,
+		PIDs:        cfg.pids,
+		LogDir:      filepath.Join(cfg.dataDir, "logs"),
+		Log:         log,
 	}
 	apiH.Register(mux)
 	return &app{store: st, mux: mux, stream: jobs, api: apiH}, nil

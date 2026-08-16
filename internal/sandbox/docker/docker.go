@@ -170,11 +170,13 @@ func (s *dockerSandbox) Wait(ctx context.Context) (int, error) {
 	return 0, fmt.Errorf("docker: wait: no status")
 }
 
-// Logs streams combined stdout and stderr from container start.
-func (s *dockerSandbox) Logs(ctx context.Context) (io.ReadCloser, error) {
+// Logs streams combined stdout and stderr from container start. With
+// follow set, the stream stays open until the container stops.
+func (s *dockerSandbox) Logs(ctx context.Context, follow bool) (io.ReadCloser, error) {
 	r, err := s.cli.ContainerLogs(ctx, s.containerID, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
+		Follow:     follow,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("docker: logs: %w", err)

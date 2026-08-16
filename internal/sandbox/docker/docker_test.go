@@ -129,7 +129,7 @@ func TestLogs(t *testing.T) {
 		t.Fatalf("Wait: %v", err)
 	}
 
-	rc, err := sb.Logs(ctx)
+	rc, err := sb.Logs(ctx, false)
 	if err != nil {
 		t.Fatalf("Logs: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestStartInjectsJIT(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
-	rc, err := sb.Logs(ctx)
+	rc, err := sb.Logs(ctx, false)
 	if err != nil {
 		t.Fatalf("Logs: %v", err)
 	}
