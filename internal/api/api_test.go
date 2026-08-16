@@ -15,9 +15,10 @@ import (
 	"time"
 
 	"github.com/CharlesBai-blc/forge/internal/job"
-	"github.com/CharlesBai-blc/forge/internal/queue"
 	"github.com/CharlesBai-blc/forge/internal/source"
 	"github.com/CharlesBai-blc/forge/internal/store"
+	"github.com/CharlesBai-blc/forge/internal/stream"
+	"github.com/alicebob/miniredis/v2"
 )
 
 const testToken = "agent-token"
@@ -83,7 +84,7 @@ func testJob(id string, external int64) *job.Job {
 	}
 }
 
-func openAPI(t *testing.T, src *fakeSource) (*store.Store, *queue.Queue, string, *Client, *fakeSource) {
+func openAPI(t *testing.T, src *fakeSource) (*store.Store, *stream.Stream, string, *Client, *fakeSource) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(context.Background(), filepath.Join(dir, "forge.db"))
@@ -94,10 +95,15 @@ func openAPI(t *testing.T, src *fakeSource) (*store.Store, *queue.Queue, string,
 	if src == nil {
 		src = &fakeSource{jit: &source.JITConfig{RunnerID: 1, Encoded: "jit-blob"}}
 	}
-	q := queue.New()
+	mr := miniredis.RunT(t)
+	jobs, err := stream.Open(context.Background(), mr.Addr())
+	if err != nil {
+		t.Fatalf("stream.Open: %v", err)
+	}
+	t.Cleanup(func() { jobs.Close() })
 	logDir := filepath.Join(dir, "logs")
 	h := &Handler{
-		Queue:     q,
+		Stream:    jobs,
 		Store:     st,
 		Source:    src,
 		Token:     testToken,
@@ -112,7 +118,17 @@ func openAPI(t *testing.T, src *fakeSource) (*store.Store, *queue.Queue, string,
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	c := &Client{BaseURL: srv.URL, Token: testToken, WorkerID: "w1", HTTP: srv.Client()}
-	return st, q, logDir, c, src
+	return st, jobs, logDir, c, src
+}
+
+func putQueued(t *testing.T, st *store.Store, jobs *stream.Stream, j *job.Job) {
+	t.Helper()
+	if err := st.CreateJob(context.Background(), j); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if err := jobs.Add(context.Background(), j.ID); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
 }
 
 func TestClaimUnauthorized(t *testing.T) {
@@ -129,14 +145,8 @@ func TestClaimUnauthorized(t *testing.T) {
 }
 
 func TestClaimAssignsAndReturnsJIT(t *testing.T) {
-	st, q, _, c, _ := openAPI(t, nil)
-	j := testJob("job-1", 1)
-	if err := st.CreateJob(context.Background(), j); err != nil {
-		t.Fatalf("CreateJob: %v", err)
-	}
-	if err := q.Enqueue(j); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
+	st, jobs, _, c, _ := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-1", 1))
 	got, err := c.Claim(context.Background())
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -166,14 +176,8 @@ func TestClaimTimeoutNoJob(t *testing.T) {
 
 func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 	src := &fakeSource{registerErr: fmt.Errorf("github down")}
-	st, q, _, c, src := openAPI(t, src)
-	j := testJob("job-jit", 2)
-	if err := st.CreateJob(context.Background(), j); err != nil {
-		t.Fatalf("CreateJob: %v", err)
-	}
-	if err := q.Enqueue(j); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
+	st, jobs, _, c, src := openAPI(t, src)
+	putQueued(t, st, jobs, testJob("job-jit", 2))
 	_, err := c.Claim(context.Background())
 	if err != ErrNoJob {
 		t.Fatalf("err = %v, want ErrNoJob", err)
@@ -181,7 +185,7 @@ func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 	if src.registerCount() < 1 {
 		t.Fatal("RegisterJIT not called")
 	}
-	row, err := st.GetJob(context.Background(), j.ID)
+	row, err := st.GetJob(context.Background(), "job-jit")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,14 +195,8 @@ func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 }
 
 func TestStatusRunningSucceededAndLogs(t *testing.T) {
-	st, q, logDir, c, src := openAPI(t, nil)
-	j := testJob("job-ok", 3)
-	if err := st.CreateJob(context.Background(), j); err != nil {
-		t.Fatalf("CreateJob: %v", err)
-	}
-	if err := q.Enqueue(j); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
+	st, jobs, logDir, c, src := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-ok", 3))
 	cl, err := c.Claim(context.Background())
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -232,14 +230,8 @@ func TestStatusRunningSucceededAndLogs(t *testing.T) {
 }
 
 func TestFailedFromAssignedUnregisters(t *testing.T) {
-	st, q, _, c, src := openAPI(t, nil)
-	j := testJob("job-start", 4)
-	if err := st.CreateJob(context.Background(), j); err != nil {
-		t.Fatalf("CreateJob: %v", err)
-	}
-	if err := q.Enqueue(j); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
+	st, jobs, _, c, src := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-start", 4))
 	cl, err := c.Claim(context.Background())
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -260,14 +252,8 @@ func TestFailedFromAssignedUnregisters(t *testing.T) {
 }
 
 func TestStaleAttemptRejected(t *testing.T) {
-	st, q, _, c, _ := openAPI(t, nil)
-	j := testJob("job-stale", 5)
-	if err := st.CreateJob(context.Background(), j); err != nil {
-		t.Fatalf("CreateJob: %v", err)
-	}
-	if err := q.Enqueue(j); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
+	st, jobs, _, c, _ := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-stale", 5))
 	cl, err := c.Claim(context.Background())
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -276,9 +262,4 @@ func TestStaleAttemptRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for stale attempt")
 	}
-}
-
-func stPath(t *testing.T, st *store.Store) string {
-	t.Helper()
-	return ""
 }

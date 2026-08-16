@@ -16,11 +16,11 @@ import (
 
 	"github.com/CharlesBai-blc/forge/internal/api"
 	"github.com/CharlesBai-blc/forge/internal/job"
-	"github.com/CharlesBai-blc/forge/internal/queue"
 	"github.com/CharlesBai-blc/forge/internal/secret"
 	"github.com/CharlesBai-blc/forge/internal/source"
 	"github.com/CharlesBai-blc/forge/internal/source/github"
 	"github.com/CharlesBai-blc/forge/internal/store"
+	"github.com/CharlesBai-blc/forge/internal/stream"
 )
 
 type config struct {
@@ -34,6 +34,7 @@ type config struct {
 	image         string
 	command       []string
 	agentToken    string
+	redis         string
 }
 
 func main() {
@@ -58,6 +59,7 @@ func parseFlags() config {
 	image := flag.String("image", envOr("FORGE_JOB_IMAGE", ""), "sandbox image")
 	command := flag.String("command", envOr("FORGE_JOB_COMMAND", ""), "sandbox command; default is actions/runner JIT")
 	agentToken := flag.String("agent-token", os.Getenv("FORGE_AGENT_TOKEN"), "shared token for forge-agent")
+	redisAddr := flag.String("redis", envOr("FORGE_REDIS", "127.0.0.1:6379"), "redis address")
 	flag.Parse()
 	return config{
 		addr:          *addr,
@@ -70,6 +72,7 @@ func parseFlags() config {
 		image:         *image,
 		command:       strings.Fields(*command),
 		agentToken:    *agentToken,
+		redis:         *redisAddr,
 	}
 }
 
@@ -161,8 +164,9 @@ func resolveOne(ctx context.Context, st *store.Store, key *[secret.KeySize]byte,
 }
 
 type app struct {
-	store *store.Store
-	mux   *http.ServeMux
+	store  *store.Store
+	mux    *http.ServeMux
+	stream *stream.Stream
 }
 
 func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.RunnerSource) (*app, error) {
@@ -195,20 +199,35 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.Runner
 			Org:    cfg.githubOrg,
 		}
 	}
-	q := queue.New()
+	jobs, err := stream.Open(ctx, cfg.redis)
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
+	queued, err := st.QueuedIDs(ctx)
+	if err != nil {
+		jobs.Close()
+		st.Close()
+		return nil, err
+	}
+	if err := jobs.Reconcile(ctx, queued); err != nil {
+		jobs.Close()
+		st.Close()
+		return nil, err
+	}
 	h := &webhookHandler{
 		src: src,
 		onJob: func(j *job.Job) error {
 			if err := st.CreateJob(ctx, j); err != nil {
 				return err
 			}
-			return q.Enqueue(j)
+			return jobs.Add(ctx, j.ID)
 		},
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/webhook/github", h)
 	apiH := &api.Handler{
-		Queue:   q,
+		Stream:  jobs,
 		Store:   st,
 		Source:  src,
 		Token:   cfg.agentToken,
@@ -218,10 +237,13 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.Runner
 		Log:     log,
 	}
 	apiH.Register(mux)
-	return &app{store: st, mux: mux}, nil
+	return &app{store: st, mux: mux, stream: jobs}, nil
 }
 
 func (a *app) Close() error {
+	if a.stream != nil {
+		_ = a.stream.Close()
+	}
 	return a.store.Close()
 }
 

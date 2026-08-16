@@ -207,6 +207,29 @@ func TestAssignIncrementsAttemptAndSetsWorker(t *testing.T) {
 	}
 }
 
+func TestQueuedIDs(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateJob(ctx, testJob("job-1")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	j2 := testJob("job-2")
+	j2.ExternalID = 2
+	if err := s.CreateJob(ctx, j2); err != nil {
+		t.Fatalf("CreateJob job-2: %v", err)
+	}
+	if _, err := s.Assign(ctx, "job-2", "w1"); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+	ids, err := s.QueuedIDs(ctx)
+	if err != nil {
+		t.Fatalf("QueuedIDs: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "job-1" {
+		t.Fatalf("QueuedIDs = %v, want [job-1]", ids)
+	}
+}
+
 func TestTransitionUnknownJob(t *testing.T) {
 	s := openTestStore(t)
 	if err := s.Transition(context.Background(), "missing", job.JobAssigned, ""); err == nil {

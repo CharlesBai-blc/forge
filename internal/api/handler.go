@@ -17,18 +17,18 @@ import (
 	"time"
 
 	"github.com/CharlesBai-blc/forge/internal/job"
-	"github.com/CharlesBai-blc/forge/internal/queue"
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
 	"github.com/CharlesBai-blc/forge/internal/source"
 	"github.com/CharlesBai-blc/forge/internal/store"
+	"github.com/CharlesBai-blc/forge/internal/stream"
 )
 
 const defaultClaimWait = 30 * time.Second
 
 // Handler serves claim, status, and log upload (FR-10, FR-9, FR-26).
 type Handler struct {
-	Queue     *queue.Queue
 	Store     *store.Store
+	Stream    *stream.Stream
 	Source    source.RunnerSource
 	Token     string
 	Image     string
@@ -38,7 +38,8 @@ type Handler struct {
 	ClaimWait time.Duration
 
 	mu   sync.Mutex
-	jits map[string]int64 // jobID/attempt -> GitHub runner ID, until consumed
+	jits map[string]int64  // jobID/attempt -> GitHub runner ID, until consumed
+	msgs map[string]string // jobID -> stream message ID, until XACK
 }
 
 // Register attaches agent routes to mux.
@@ -80,8 +81,17 @@ func (h *Handler) claim(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), wait)
 	defer cancel()
-	j, err := h.Queue.Claim(ctx)
+	msg, err := h.Stream.Claim(ctx, workerID, wait)
 	if err != nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	j, err := h.Store.GetJob(r.Context(), msg.JobID)
+	if err != nil || j.State != job.JobQueued {
+		if aerr := h.Stream.Ack(context.Background(), msg.ID); aerr != nil {
+			h.log().Error("ack skip", "job", msg.JobID, "err", aerr)
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -89,12 +99,6 @@ func (h *Handler) claim(w http.ResponseWriter, r *http.Request) {
 	jit, err := h.Source.RegisterJIT(r.Context(), j)
 	if err != nil {
 		h.log().Error("register jit", "job", j.ID, "err", err)
-		if err := h.Queue.Enqueue(j); err != nil {
-			h.log().Error("requeue", "job", j.ID, "err", err)
-			if terr := h.Store.Transition(r.Context(), j.ID, job.JobFailed, "register_jit: "+err.Error()); terr != nil {
-				h.log().Error("transition", "job", j.ID, "err", terr)
-			}
-		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -113,7 +117,11 @@ func (h *Handler) claim(w http.ResponseWriter, r *http.Request) {
 	if h.jits == nil {
 		h.jits = make(map[string]int64)
 	}
+	if h.msgs == nil {
+		h.msgs = make(map[string]string)
+	}
 	h.jits[jitKey(assigned.ID, assigned.Attempt)] = jit.RunnerID
+	h.msgs[assigned.ID] = msg.ID
 	h.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -168,6 +176,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.forgetJIT(jobID, n, false)
+		h.ackJob(jobID)
 	case job.JobFailed:
 		reason := rep.Reason
 		if reason == "" && rep.ExitCode != nil {
@@ -185,6 +194,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.forgetJIT(jobID, n, false)
+		h.ackJob(jobID)
 	default:
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -238,6 +248,21 @@ func (h *Handler) forgetJIT(jobID string, attempt int, unregister bool) {
 	}
 	if err := h.Source.Unregister(context.Background(), id); err != nil {
 		h.log().Error("unregister", "job", jobID, "runner", id, "err", err)
+	}
+}
+
+func (h *Handler) ackJob(jobID string) {
+	h.mu.Lock()
+	id, ok := h.msgs[jobID]
+	if ok {
+		delete(h.msgs, jobID)
+	}
+	h.mu.Unlock()
+	if !ok {
+		return
+	}
+	if err := h.Stream.Ack(context.Background(), id); err != nil {
+		h.log().Error("ack", "job", jobID, "err", err)
 	}
 }
 
