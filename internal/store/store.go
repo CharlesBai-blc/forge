@@ -165,6 +165,9 @@ func (s *Store) CreateJob(ctx context.Context, j *job.Job) error {
 		j.ID, j.Source, j.ExternalID, j.Repo, j.RunID, string(labels), string(j.State),
 		j.Attempt, j.WorkerID, boolToInt(j.DeadLettered), j.Reason, formatTime(now), formatTime(now))
 	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed: jobs.") {
+			return fmt.Errorf("%w: %s/%d", ErrDuplicateJob, j.Source, j.ExternalID)
+		}
 		return fmt.Errorf("store: insert job: %w", err)
 	}
 
@@ -223,8 +226,9 @@ func (s *Store) Transition(ctx context.Context, jobID string, to job.JobState, r
 	return tx.Commit()
 }
 
-// Assign is claim delivery: increment attempt, set worker, queued -> assigned.
-func (s *Store) Assign(ctx context.Context, jobID, workerID string) (*job.Job, error) {
+// Assign is claim delivery: increment attempt, set worker, record the
+// attempt's JIT runner registration, queued -> assigned.
+func (s *Store) Assign(ctx context.Context, jobID, workerID string, runnerID int64) (*job.Job, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("store: begin tx: %w", err)
@@ -249,9 +253,9 @@ func (s *Store) Assign(ctx context.Context, jobID, workerID string) (*job.Job, e
 	attempt++
 	now := formatTime(time.Now().UTC())
 	if _, err := tx.ExecContext(ctx, `
-		UPDATE jobs SET state = ?, attempt = ?, worker_id = NULLIF(?, ''), updated_at = ?
+		UPDATE jobs SET state = ?, attempt = ?, worker_id = NULLIF(?, ''), runner_id = NULLIF(?, 0), updated_at = ?
 		WHERE id = ?`,
-		string(job.JobAssigned), attempt, workerID, now, jobID,
+		string(job.JobAssigned), attempt, workerID, runnerID, now, jobID,
 	); err != nil {
 		return nil, fmt.Errorf("store: assign update: %w", err)
 	}
@@ -266,6 +270,35 @@ func (s *Store) Assign(ctx context.Context, jobID, workerID string) (*job.Job, e
 		return nil, err
 	}
 	return s.GetJob(ctx, jobID)
+}
+
+// TakeRunnerID atomically reads and clears the job's persisted JIT
+// runner registration (FR-5). ok is false when none is recorded.
+func (s *Store) TakeRunnerID(ctx context.Context, jobID string) (runnerID int64, ok bool, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("store: begin take runner: %w", err)
+	}
+	defer tx.Rollback()
+
+	var id sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT runner_id FROM jobs WHERE id = ?`, jobID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("store: take runner: %w", err)
+	}
+	if !id.Valid {
+		return 0, false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET runner_id = NULL WHERE id = ?`, jobID); err != nil {
+		return 0, false, fmt.Errorf("store: clear runner: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, err
+	}
+	return id.Int64, true, nil
 }
 
 // Requeue moves a lost job back to queued and clears the worker (FR-11).
@@ -413,11 +446,33 @@ func (s *Store) QueuedIDs(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
+// ErrJobNotFound is returned by GetJob when no row matches. Callers use
+// it to distinguish a missing job from a transient store error.
+var ErrJobNotFound = errors.New("store: job not found")
+
+// ErrDuplicateJob is returned by CreateJob when a job with the same
+// (source, external_id) already exists: a webhook redelivery.
+var ErrDuplicateJob = errors.New("store: duplicate job")
+
+// GetJobBySource returns the job for a provider-side ID (webhook
+// redelivery idempotency).
+func (s *Store) GetJobBySource(ctx context.Context, source string, externalID int64) (*job.Job, error) {
+	j, err := scanJob(s.db.QueryRowContext(ctx,
+		`SELECT `+jobCols+` FROM jobs WHERE source = ? AND external_id = ?`, source, externalID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %s/%d", ErrJobNotFound, source, externalID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: select job by source: %w", err)
+	}
+	return j, nil
+}
+
 // GetJob returns a job by ID.
 func (s *Store) GetJob(ctx context.Context, id string) (*job.Job, error) {
 	j, err := scanJob(s.db.QueryRowContext(ctx, `SELECT `+jobCols+` FROM jobs WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("store: job %s not found", id)
+		return nil, fmt.Errorf("%w: %s", ErrJobNotFound, id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("store: select job: %w", err)

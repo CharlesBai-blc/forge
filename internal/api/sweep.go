@@ -2,9 +2,11 @@ package api
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/CharlesBai-blc/forge/internal/job"
+	"github.com/CharlesBai-blc/forge/internal/store"
 )
 
 func (h *Handler) lostAfter() time.Duration {
@@ -99,7 +101,11 @@ func (h *Handler) reclaimIdle(ctx context.Context) error {
 func (h *Handler) reclaim(ctx context.Context, jobID, msgID string) error {
 	j, err := h.Store.GetJob(ctx, jobID)
 	if err != nil {
-		return h.Stream.Ack(ctx, msgID)
+		if errors.Is(err, store.ErrJobNotFound) {
+			return h.Stream.Ack(ctx, msgID)
+		}
+		// Transient store error: leave the entry pending and retry next sweep.
+		return err
 	}
 	switch j.State {
 	case job.JobSucceeded, job.JobFailed:
@@ -111,12 +117,18 @@ func (h *Handler) reclaim(ctx context.Context, jobID, msgID string) error {
 		return h.Stream.Add(ctx, jobID)
 	}
 
+	// A live worker's in-flight job is not reclaimed: return the entry
+	// to the worker and reset its idle time (FR-11, tdd.md §6.2).
+	if (j.State == job.JobAssigned || j.State == job.JobRunning) && h.workerHoldsJob(ctx, j) {
+		return h.Stream.Extend(ctx, msgID, j.WorkerID)
+	}
+
 	acquired := j.State == job.JobRunning
 	if j.State != job.JobLost {
 		if err := h.Store.Transition(ctx, jobID, job.JobLost, "visibility_timeout"); err != nil {
 			return err
 		}
-		h.forgetJIT(jobID, j.Attempt, !acquired)
+		h.forgetJIT(jobID, !acquired)
 	}
 	if acquired {
 		if err := h.Store.Transition(ctx, jobID, job.JobFailed, "worker_lost"); err != nil {
@@ -146,6 +158,34 @@ func (h *Handler) forgetMsg(jobID string) {
 	h.mu.Lock()
 	delete(h.msgs, jobID)
 	h.mu.Unlock()
+}
+
+// workerHoldsJob reports whether j's worker is live and still claims the
+// job. A worker that has not heartbeated since control-plane start is
+// granted grace as long as its last_seen is fresh, so a restart cannot
+// falsely reclaim in-flight work before the first heartbeats arrive.
+func (h *Handler) workerHoldsJob(ctx context.Context, j *job.Job) bool {
+	if j.WorkerID == "" {
+		return false
+	}
+	w, err := h.Store.GetWorker(ctx, j.WorkerID)
+	if err != nil {
+		return false
+	}
+	if w.State == job.WorkerLost || w.State == job.WorkerRemoved {
+		return false
+	}
+	cutoff := time.Now().UTC().Add(-h.lostAfter())
+	if w.LastSeen.Before(cutoff) {
+		return false
+	}
+	h.mu.Lock()
+	running, heartbeated := h.hbs[j.WorkerID]
+	h.mu.Unlock()
+	if !heartbeated {
+		return true
+	}
+	return running[j.ID]
 }
 
 func (h *Handler) progressDrains(ctx context.Context) error {
@@ -184,9 +224,11 @@ func (h *Handler) drainAssigned(ctx context.Context, workerID string, j *job.Job
 	if err := h.Store.DrainRequeue(ctx, j.ID); err != nil {
 		return err
 	}
-	h.forgetJIT(j.ID, j.Attempt, true)
+	h.forgetJIT(j.ID, true)
 	h.forgetMsg(j.ID)
-	pending, err := h.Stream.PendingFor(ctx, workerID)
+	// Search the whole PEL: the entry may have been auto-claimed by the
+	// sweeper and no longer sit under the worker's consumer.
+	pending, err := h.Stream.PendingAll(ctx)
 	if err != nil {
 		return err
 	}

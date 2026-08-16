@@ -34,7 +34,7 @@ func (s *fakeSandbox) Wait(context.Context) (int, error) {
 	return 0, nil
 }
 
-func (s *fakeSandbox) Logs(context.Context) (io.ReadCloser, error) {
+func (s *fakeSandbox) Logs(context.Context, bool) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
 

@@ -30,12 +30,13 @@ type Worker struct {
 	Version   string
 }
 
-// workerTransitions is tdd.md §4.3.
+// workerTransitions is tdd.md §4.3. A lost worker revives to the
+// operational state it held before going lost (FR-19, FR-20).
 var workerTransitions = map[WorkerState]map[WorkerState]bool{
 	WorkerActive:   {WorkerCordoned: true, WorkerDraining: true, WorkerLost: true},
 	WorkerCordoned: {WorkerActive: true, WorkerDraining: true, WorkerLost: true, WorkerRemoved: true},
 	WorkerDraining: {WorkerCordoned: true, WorkerLost: true},
-	WorkerLost:     {WorkerActive: true, WorkerRemoved: true},
+	WorkerLost:     {WorkerActive: true, WorkerCordoned: true, WorkerDraining: true, WorkerRemoved: true},
 	WorkerRemoved:  {},
 }
 

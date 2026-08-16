@@ -101,7 +101,7 @@ func TestDashboardDeadLetter(t *testing.T) {
 	if err := st.CreateJob(ctx, testJob("job-dl", 12)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Assign(ctx, "job-dl", "w1"); err != nil {
+	if _, err := st.Assign(ctx, "job-dl", "w1", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Transition(ctx, "job-dl", job.JobLost, "visibility_timeout"); err != nil {

@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	"github.com/CharlesBai-blc/forge/internal/store"
 	"github.com/CharlesBai-blc/forge/internal/stream"
 	"github.com/alicebob/miniredis/v2"
+	_ "modernc.org/sqlite"
 )
 
 func enrollWorker(t *testing.T, st *store.Store) (id, token string) {
@@ -115,14 +117,17 @@ func openAPI(t *testing.T, src *fakeSource) (*store.Store, *stream.Stream, strin
 	t.Cleanup(func() { jobs.Close() })
 	logDir := filepath.Join(dir, "logs")
 	h := &Handler{
-		Stream:    jobs,
-		Store:     st,
-		Source:    src,
-		Image:     "alpine:3.20",
-		Command:   []string{"true"},
-		LogDir:    logDir,
-		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		ClaimWait: 50 * time.Millisecond,
+		Stream:      jobs,
+		Store:       st,
+		Source:      src,
+		Image:       "alpine:3.20",
+		Command:     []string{"true"},
+		CPU:         2,
+		MemoryBytes: 4096 << 20,
+		PIDs:        4096,
+		LogDir:      logDir,
+		Log:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		ClaimWait:   50 * time.Millisecond,
 	}
 	mux := http.NewServeMux()
 	h.Register(mux)
@@ -242,6 +247,9 @@ func TestClaimAssignsAndReturnsJIT(t *testing.T) {
 	if got.Spec.Image != "alpine:3.20" || len(got.Spec.Command) != 1 || got.Spec.Command[0] != "true" {
 		t.Fatalf("spec = %+v", got.Spec)
 	}
+	if got.Spec.CPU != 2 || got.Spec.MemoryBytes != 4096<<20 || got.Spec.PIDs != 4096 {
+		t.Fatalf("spec limits = %+v, want FR-14 limits", got.Spec)
+	}
 	row, err := st.GetJob(context.Background(), "job-1")
 	if err != nil {
 		t.Fatal(err)
@@ -276,6 +284,92 @@ func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 	}
 	if row.State != job.JobQueued {
 		t.Fatalf("State = %s, want queued", row.State)
+	}
+}
+
+func TestClaimAfterRestartFromAssigned(t *testing.T) {
+	st, jobs, _, c, src, _ := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-restart", 40))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if cl.Attempt != 1 {
+		t.Fatalf("attempt = %d, want 1", cl.Attempt)
+	}
+	// Agent restarts without reporting anything and claims again: the
+	// redelivered entry must resolve into a fresh attempt, not strand
+	// the job in assigned.
+	cl2, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("second Claim: %v", err)
+	}
+	if cl2.JobID != cl.JobID || cl2.Attempt != 2 {
+		t.Fatalf("claim = %+v, want same job attempt 2", cl2)
+	}
+	if ids := src.unregisterIDs(); len(ids) != 1 {
+		t.Errorf("Unregister = %v, want one for the abandoned attempt", ids)
+	}
+	trs, err := st.ListTransitions(context.Background(), cl.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restart bool
+	for _, tr := range trs {
+		if tr.To == job.JobLost && tr.Reason == "worker_restart" {
+			restart = true
+		}
+	}
+	if !restart {
+		t.Errorf("transitions missing lost(worker_restart): %+v", trs)
+	}
+}
+
+func TestClaimAfterRestartFromRunning(t *testing.T) {
+	st, jobs, _, c, _, _ := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-restart-run", 41))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobRunning}); err != nil {
+		t.Fatal(err)
+	}
+	// Agent restarts and claims again: a running job was acquired on
+	// GitHub, so it fails instead of re-dispatching.
+	if _, err := c.Claim(context.Background()); err != ErrNoJob {
+		t.Fatalf("second Claim err = %v, want ErrNoJob", err)
+	}
+	row, err := st.GetJob(context.Background(), cl.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobFailed || row.Reason != "worker_lost" {
+		t.Fatalf("job = %+v", row)
+	}
+}
+
+func TestClaimTransientStoreErrorLeavesPending(t *testing.T) {
+	st, jobs, logDir, c, _, _ := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-transient", 42))
+	// Corrupt the row so GetJob fails with a non-not-found error.
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(logDir), "forge.db")+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE jobs SET labels = '{' WHERE id = 'job-transient'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Claim(context.Background()); err != ErrNoJob {
+		t.Fatalf("Claim err = %v, want ErrNoJob", err)
+	}
+	pending, err := jobs.PendingFor(context.Background(), c.WorkerID)
+	if err != nil {
+		t.Fatalf("PendingFor: %v", err)
+	}
+	if len(pending) != 1 || pending[0].JobID != "job-transient" {
+		t.Fatalf("pending = %+v, want the undropped entry", pending)
 	}
 }
 
@@ -314,9 +408,40 @@ func TestStatusRunningSucceededAndLogs(t *testing.T) {
 	}
 }
 
-func TestFailedFromAssignedUnregisters(t *testing.T) {
+func TestFailedFromAssignedRequeues(t *testing.T) {
 	st, jobs, _, c, src, _ := openAPI(t, nil)
 	putQueued(t, st, jobs, testJob("job-start", 4))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobFailed, Reason: "start failed"}); err != nil {
+		t.Fatalf("failed: %v", err)
+	}
+	// Pre-acquisition failure requeues to the fleet (tdd.md §6.5).
+	row, err := st.GetJob(context.Background(), cl.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobQueued || row.WorkerID != "" || row.Attempt != 1 {
+		t.Fatalf("job = %+v, want requeued", row)
+	}
+	if ids := src.unregisterIDs(); len(ids) != 1 || ids[0] != 1 {
+		t.Errorf("Unregister = %v, want [1]", ids)
+	}
+	cl2, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("second Claim: %v", err)
+	}
+	if cl2.JobID != cl.JobID || cl2.Attempt != 2 {
+		t.Fatalf("claim = %+v, want same job attempt 2", cl2)
+	}
+}
+
+func TestFailedFromAssignedDeadLettersAtMax(t *testing.T) {
+	st, jobs, _, c, src, h := openAPI(t, nil)
+	h.MaxAttempts = 1
+	putQueued(t, st, jobs, testJob("job-start-dl", 44))
 	cl, err := c.Claim(context.Background())
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -328,11 +453,40 @@ func TestFailedFromAssignedUnregisters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row.State != job.JobFailed {
-		t.Fatalf("State = %s", row.State)
+	if row.State != job.JobFailed || !row.DeadLettered || row.Reason != "max_attempts" {
+		t.Fatalf("job = %+v, want dead-lettered", row)
 	}
 	if ids := src.unregisterIDs(); len(ids) != 1 || ids[0] != 1 {
 		t.Errorf("Unregister = %v, want [1]", ids)
+	}
+}
+
+func TestLogsStaleAttemptRejected(t *testing.T) {
+	st, jobs, logDir, c, _, _ := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-logfence", 43))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := c.Logs(context.Background(), cl.JobID, cl.Attempt+1, bytes.NewReader([]byte("stale"))); err == nil {
+		t.Fatal("expected stale attempt log upload to be rejected")
+	}
+	if _, err := os.Stat(filepath.Join(logDir, fmt.Sprintf("%s-%d.log", cl.JobID, cl.Attempt+1))); !os.IsNotExist(err) {
+		t.Fatalf("stale log file created: %v", err)
+	}
+	// Appended chunks for the current attempt accumulate in order.
+	if err := c.AppendLogs(context.Background(), cl.JobID, cl.Attempt, bytes.NewReader([]byte("a\n"))); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := c.AppendLogs(context.Background(), cl.JobID, cl.Attempt, bytes.NewReader([]byte("b\n"))); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(logDir, fmt.Sprintf("%s-%d.log", cl.JobID, cl.Attempt)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "a\nb\n" {
+		t.Fatalf("log = %q, want appended chunks", b)
 	}
 }
 
@@ -399,6 +553,32 @@ func TestStatusDuplicateIsNoContent(t *testing.T) {
 	}
 }
 
+func TestAckAfterRestartScansPEL(t *testing.T) {
+	st, jobs, _, c, _, h := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-ack", 45))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobRunning}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a control-plane restart losing the in-memory message map.
+	h.mu.Lock()
+	h.msgs = nil
+	h.mu.Unlock()
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobSucceeded}); err != nil {
+		t.Fatalf("succeeded: %v", err)
+	}
+	pending, err := jobs.PendingAll(context.Background())
+	if err != nil {
+		t.Fatalf("PendingAll: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending = %+v, want acked via PEL scan", pending)
+	}
+}
+
 func TestHeartbeatRestoresLost(t *testing.T) {
 	st, _, _, c, _, _ := openAPI(t, nil)
 	ctx := context.Background()
@@ -460,6 +640,15 @@ func TestSweepMarksStaleWorkerLost(t *testing.T) {
 	}
 }
 
+// ageWorker moves a worker's last_seen past the lost threshold so sweep
+// tests exercise the genuinely-dead-worker path.
+func ageWorker(t *testing.T, st *store.Store, id string) {
+	t.Helper()
+	if err := st.SetLastSeen(context.Background(), id, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("SetLastSeen: %v", err)
+	}
+}
+
 func TestSweepRequeuesAssigned(t *testing.T) {
 	st, jobs, _, c, src, h := openAPI(t, nil)
 	h.Visibility = time.Millisecond
@@ -468,6 +657,7 @@ func TestSweepRequeuesAssigned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
+	ageWorker(t, st, c.WorkerID)
 	time.Sleep(2 * time.Millisecond)
 	if err := h.Sweep(context.Background()); err != nil {
 		t.Fatalf("Sweep: %v", err)
@@ -481,6 +671,10 @@ func TestSweepRequeuesAssigned(t *testing.T) {
 	}
 	if ids := src.unregisterIDs(); len(ids) != 1 || ids[0] != 1 {
 		t.Errorf("Unregister = %v, want [1]", ids)
+	}
+	// The aged worker went lost during the sweep; a heartbeat revives it.
+	if err := c.Heartbeat(context.Background(), Heartbeat{Capacity: 1, Healthy: true}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
 	}
 	cl2, err := c.Claim(context.Background())
 	if err != nil {
@@ -499,6 +693,7 @@ func TestSweepDeadLettersAfterMaxAttempts(t *testing.T) {
 	if _, err := c.Claim(context.Background()); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
+	ageWorker(t, st, c.WorkerID)
 	time.Sleep(2 * time.Millisecond)
 	if err := h.Sweep(context.Background()); err != nil {
 		t.Fatalf("Sweep: %v", err)
@@ -523,6 +718,7 @@ func TestSweepFailsRunningAsWorkerLost(t *testing.T) {
 	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobRunning}); err != nil {
 		t.Fatal(err)
 	}
+	ageWorker(t, st, c.WorkerID)
 	time.Sleep(2 * time.Millisecond)
 	if err := h.Sweep(context.Background()); err != nil {
 		t.Fatalf("Sweep: %v", err)
@@ -536,6 +732,91 @@ func TestSweepFailsRunningAsWorkerLost(t *testing.T) {
 	}
 	if ids := src.unregisterIDs(); len(ids) != 0 {
 		t.Errorf("Unregister = %v, want none after running", ids)
+	}
+}
+
+func TestSweepLeavesHealthyRunningJob(t *testing.T) {
+	st, jobs, _, c, _, h := openAPI(t, nil)
+	h.Visibility = time.Millisecond
+	putQueued(t, st, jobs, testJob("job-long", 30))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Heartbeat(context.Background(), Heartbeat{Capacity: 1, Healthy: true, Running: []string{cl.JobID}}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		time.Sleep(2 * time.Millisecond)
+		if err := h.Sweep(context.Background()); err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+	}
+	row, err := st.GetJob(context.Background(), cl.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobRunning {
+		t.Fatalf("state = %s, want running past visibility timeout", row.State)
+	}
+	// The worker still finishes normally.
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobSucceeded}); err != nil {
+		t.Fatalf("succeeded: %v", err)
+	}
+}
+
+func TestSweepReclaimsWhenHeartbeatOmitsJob(t *testing.T) {
+	st, jobs, _, c, _, h := openAPI(t, nil)
+	h.Visibility = time.Millisecond
+	putQueued(t, st, jobs, testJob("job-omitted", 31))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := c.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobRunning}); err != nil {
+		t.Fatal(err)
+	}
+	// Live worker heartbeats but no longer reports the job: it restarted
+	// and abandoned the attempt.
+	if err := c.Heartbeat(context.Background(), Heartbeat{Capacity: 1, Healthy: true}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := h.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	row, err := st.GetJob(context.Background(), cl.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobFailed || row.Reason != "worker_lost" {
+		t.Fatalf("job = %+v", row)
+	}
+}
+
+func TestSweepGraceBeforeFirstHeartbeat(t *testing.T) {
+	st, jobs, _, c, _, h := openAPI(t, nil)
+	h.Visibility = time.Millisecond
+	putQueued(t, st, jobs, testJob("job-grace", 32))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	// No heartbeat processed since control-plane start, worker last_seen
+	// fresh: the sweeper must not reclaim.
+	time.Sleep(2 * time.Millisecond)
+	if err := h.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	row, err := st.GetJob(context.Background(), cl.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobAssigned {
+		t.Fatalf("state = %s, want assigned under restart grace", row.State)
 	}
 }
 
@@ -595,6 +876,53 @@ func TestSweepDrainRequeuesAssigned(t *testing.T) {
 	}
 	if w.State != job.WorkerCordoned {
 		t.Fatalf("state = %s, want cordoned", w.State)
+	}
+}
+
+func TestSweepDrainAcksSweeperHeldEntry(t *testing.T) {
+	st, jobs, _, c, src, h := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-drain-held", 46))
+	if _, err := c.Claim(context.Background()); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	// Move the pending entry to the sweeper consumer, as an earlier
+	// auto-claim pass would.
+	if _, err := jobs.AutoClaim(context.Background(), 0); err != nil {
+		t.Fatalf("AutoClaim: %v", err)
+	}
+	if err := st.TransitionWorker(context.Background(), c.WorkerID, job.WorkerDraining); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Sweep(context.Background()); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	row, err := st.GetJob(context.Background(), "job-drain-held")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.State != job.JobQueued || row.Attempt != 0 {
+		t.Fatalf("job = %+v, want drain-requeued", row)
+	}
+	// The sweeper-held entry was found and acked; only the fresh,
+	// undelivered entry remains.
+	pending, err := jobs.PendingAll(context.Background())
+	if err != nil {
+		t.Fatalf("PendingAll: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending = %+v, want empty after drain ack", pending)
+	}
+	id2, tok2 := enrollWorker(t, st)
+	other := &Client{BaseURL: c.BaseURL, Token: tok2, WorkerID: id2, HTTP: c.HTTP}
+	cl, err := other.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("other Claim: %v", err)
+	}
+	if cl.JobID != "job-drain-held" || cl.Attempt != 1 {
+		t.Fatalf("claim = %+v", cl)
+	}
+	if ids := src.unregisterIDs(); len(ids) != 1 {
+		t.Errorf("Unregister = %v, want one for the drained assignment", ids)
 	}
 }
 

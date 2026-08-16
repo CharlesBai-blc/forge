@@ -2,9 +2,11 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"time"
@@ -191,8 +193,13 @@ func (r *Runner) runOne(ctx context.Context, cl *api.ClaimResponse) {
 	}
 	report(api.StatusReport{State: job.JobRunning})
 
+	stop := r.startLogStream(ctx, sb, cl)
 	code, waitErr := sb.Wait(ctx)
-	r.uploadLogs(context.Background(), sb, cl)
+	if !stop() {
+		// The live stream did not complete cleanly; re-upload the full
+		// log so the stored copy is complete (FR-26).
+		r.uploadLogs(context.Background(), sb, cl)
+	}
 	if waitErr != nil {
 		report(api.StatusReport{State: job.JobFailed, Reason: waitErr.Error()})
 		return
@@ -248,8 +255,57 @@ func (r *Runner) flushStatus(ctx context.Context) error {
 	}
 }
 
+// startLogStream copies the sandbox's combined output to the control
+// plane in chunks while the job runs (FR-24, tdd.md §4.8). The returned
+// stop joins the stream and reports whether every chunk was delivered;
+// on false the caller uploads a full snapshot instead.
+func (r *Runner) startLogStream(ctx context.Context, sb sandbox.Sandbox, cl *api.ClaimResponse) (stop func() bool) {
+	rc, err := sb.Logs(ctx, true)
+	if err != nil {
+		r.Log.Error("logs follow", "job", cl.JobID, "err", err)
+		return func() bool { return false }
+	}
+	done := make(chan bool, 1)
+	go func() {
+		clean := true
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := rc.Read(buf)
+			if n > 0 {
+				if err := r.Client.AppendLogs(ctx, cl.JobID, cl.Attempt, bytes.NewReader(buf[:n])); err != nil {
+					if ctx.Err() == nil {
+						r.Log.Error("logs stream", "job", cl.JobID, "err", err)
+					}
+					clean = false
+					break
+				}
+			}
+			if rerr != nil {
+				if rerr != io.EOF && ctx.Err() == nil {
+					r.Log.Error("logs follow read", "job", cl.JobID, "err", rerr)
+					clean = false
+				}
+				break
+			}
+		}
+		rc.Close()
+		done <- clean
+	}()
+	return func() bool {
+		select {
+		case clean := <-done:
+			return clean
+		case <-time.After(5 * time.Second):
+			// The follow stream did not end with the container; force it.
+			rc.Close()
+			<-done
+			return false
+		}
+	}
+}
+
 func (r *Runner) uploadLogs(ctx context.Context, sb sandbox.Sandbox, cl *api.ClaimResponse) {
-	rc, err := sb.Logs(ctx)
+	rc, err := sb.Logs(ctx, false)
 	if err != nil {
 		r.Log.Error("logs", "job", cl.JobID, "err", err)
 		return
