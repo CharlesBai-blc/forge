@@ -230,6 +230,60 @@ func TestQueuedIDs(t *testing.T) {
 	}
 }
 
+func TestListJobsCountQueuedAndTransitions(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateJob(ctx, testJob("job-1")); err != nil {
+		t.Fatalf("CreateJob job-1: %v", err)
+	}
+	j2 := testJob("job-2")
+	j2.ExternalID = 2
+	if err := s.CreateJob(ctx, j2); err != nil {
+		t.Fatalf("CreateJob job-2: %v", err)
+	}
+	if _, err := s.Assign(ctx, "job-2", "w1"); err != nil {
+		t.Fatalf("Assign: %v", err)
+	}
+
+	jobs, err := s.ListJobs(ctx, 0)
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	if len(jobs) != 2 || jobs[0].ID != "job-2" || jobs[1].ID != "job-1" {
+		t.Fatalf("ListJobs = %v, want [job-2 job-1]", jobIDs(jobs))
+	}
+
+	n, err := s.CountQueued(ctx)
+	if err != nil {
+		t.Fatalf("CountQueued: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("CountQueued = %d, want 1", n)
+	}
+
+	trs, err := s.ListTransitions(ctx, "job-2")
+	if err != nil {
+		t.Fatalf("ListTransitions: %v", err)
+	}
+	if len(trs) != 2 {
+		t.Fatalf("len(transitions) = %d, want 2", len(trs))
+	}
+	if trs[0].To != job.JobQueued || trs[1].From != job.JobQueued || trs[1].To != job.JobAssigned {
+		t.Fatalf("transitions = %+v", trs)
+	}
+	if trs[1].Attempt != 1 {
+		t.Fatalf("assign attempt = %d, want 1", trs[1].Attempt)
+	}
+}
+
+func jobIDs(jobs []*job.Job) []string {
+	out := make([]string, len(jobs))
+	for i, j := range jobs {
+		out[i] = j.ID
+	}
+	return out
+}
+
 func TestTransitionUnknownJob(t *testing.T) {
 	s := openTestStore(t)
 	if err := s.Transition(context.Background(), "missing", job.JobAssigned, ""); err == nil {

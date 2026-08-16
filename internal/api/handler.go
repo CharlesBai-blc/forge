@@ -44,19 +44,24 @@ type Handler struct {
 	Visibility  time.Duration
 	MaxAttempts int
 	SweepEvery  time.Duration
+	LogPoll     time.Duration
 
 	mu   sync.Mutex
 	jits map[string]int64  // jobID/attempt -> GitHub runner ID, until consumed
 	msgs map[string]string // jobID -> stream message ID, until XACK
 }
 
-// Register attaches agent routes to mux.
+// Register attaches agent and dashboard routes to mux.
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/agents/enroll", h.enroll)
 	mux.HandleFunc("POST /v1/agents/{id}/heartbeat", h.heartbeat)
 	mux.HandleFunc("GET /v1/agents/{id}/claim", h.claim)
 	mux.HandleFunc("POST /v1/jobs/{id}/attempts/{n}/status", h.status)
 	mux.HandleFunc("POST /v1/jobs/{id}/attempts/{n}/logs", h.logs)
+	mux.HandleFunc("GET /{$}", h.page)
+	mux.HandleFunc("GET /v1/dashboard", h.dashboard)
+	mux.HandleFunc("GET /v1/jobs/{id}", h.jobDetail)
+	mux.HandleFunc("GET /v1/jobs/{id}/logs/stream", h.logStream)
 }
 
 func (h *Handler) log() *slog.Logger {
