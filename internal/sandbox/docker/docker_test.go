@@ -146,7 +146,7 @@ func TestLogs(t *testing.T) {
 
 func TestStartInjectsJIT(t *testing.T) {
 	p := dockerProvider(t)
-	sb := createSandbox(t, p, testSpec("cat", "/"+jitPath))
+	sb := createSandbox(t, p, testSpec("su", "-s", "/bin/sh", "nobody", "-c", "cat /"+jitPath))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	const blob = "jit-encoded-blob"
