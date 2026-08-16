@@ -126,10 +126,6 @@ func TestValidateCredsRequired(t *testing.T) {
 		t.Fatal("expected error for missing webhook secret")
 	}
 	cfg = config{webhookSecret: "s", githubToken: "tok"}
-	if err := cfg.validateCreds(); err == nil {
-		t.Fatal("expected error for missing agent token")
-	}
-	cfg = config{webhookSecret: "s", githubToken: "tok", agentToken: "a"}
 	if err := cfg.validateCreds(); err != nil {
 		t.Fatalf("validateCreds: %v", err)
 	}
@@ -147,12 +143,12 @@ func TestResolveCredsPersistsEncrypted(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	const webhook, token, agent = "super-secret-webhook", "ghp_plaintext_token", "agent-secret"
-	got, err := resolveCreds(ctx, st, key, config{webhookSecret: webhook, githubToken: token, agentToken: agent})
+	const webhook, token = "super-secret-webhook", "ghp_plaintext_token"
+	got, err := resolveCreds(ctx, st, key, config{webhookSecret: webhook, githubToken: token})
 	if err != nil {
 		t.Fatalf("resolveCreds: %v", err)
 	}
-	if got.webhookSecret != webhook || got.githubToken != token || got.agentToken != agent {
+	if got.webhookSecret != webhook || got.githubToken != token {
 		t.Fatalf("resolved = %+v", got)
 	}
 
@@ -160,7 +156,7 @@ func TestResolveCredsPersistsEncrypted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read db: %v", err)
 	}
-	if bytes.Contains(raw, []byte(webhook)) || bytes.Contains(raw, []byte(token)) || bytes.Contains(raw, []byte(agent)) {
+	if bytes.Contains(raw, []byte(webhook)) || bytes.Contains(raw, []byte(token)) {
 		t.Fatal("plaintext credential found in database file")
 	}
 
@@ -178,7 +174,7 @@ func TestResolveCredsPersistsEncrypted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload creds: %v", err)
 	}
-	if loaded.webhookSecret != webhook || loaded.githubToken != token || loaded.agentToken != agent {
+	if loaded.webhookSecret != webhook || loaded.githubToken != token {
 		t.Fatalf("loaded = %+v", loaded)
 	}
 }
@@ -233,7 +229,6 @@ func TestStartupReconcilesQueued(t *testing.T) {
 		githubOwner:   "owner",
 		githubRepo:    "name",
 		image:         "alpine:3.20",
-		agentToken:    "agent-tok",
 		redis:         mr.Addr(),
 	}
 	a, err := newApp(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), src)
@@ -243,7 +238,8 @@ func TestStartupReconcilesQueued(t *testing.T) {
 	t.Cleanup(func() { a.Close() })
 	srv := httptest.NewServer(a.mux)
 	t.Cleanup(srv.Close)
-	c := &api.Client{BaseURL: srv.URL, Token: cfg.agentToken, WorkerID: "w1", HTTP: srv.Client()}
+	id, tok := enrollWorker(t, a.store)
+	c := &api.Client{BaseURL: srv.URL, Token: tok, WorkerID: id, HTTP: srv.Client()}
 	cl, err := c.Claim(ctx)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -298,7 +294,6 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 		githubRepo:    "name",
 		image:         "alpine:3.20",
 		command:       []string{"true"},
-		agentToken:    "agent-tok",
 	}
 	mr := miniredis.RunT(t)
 	cfg.redis = mr.Addr()
@@ -317,8 +312,9 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 	srv := httptest.NewServer(a.mux)
 	t.Cleanup(srv.Close)
 
+	id, tok := enrollWorker(t, a.store)
 	agent := &runner.Runner{
-		Client:   &api.Client{BaseURL: srv.URL, Token: cfg.agentToken, WorkerID: "w1", HTTP: srv.Client()},
+		Client:   &api.Client{BaseURL: srv.URL, Token: tok, WorkerID: id, HTTP: srv.Client()},
 		Provider: prov,
 		Log:      log,
 	}
@@ -406,4 +402,42 @@ func waitContainersGone(t *testing.T, cli *client.Client, ids []string) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("containers still present: %v", ids)
+}
+
+func enrollWorker(t *testing.T, st *store.Store) (id, token string) {
+	t.Helper()
+	ctx := context.Background()
+	enroll, err := st.IssueEnrollmentToken(ctx)
+	if err != nil {
+		t.Fatalf("IssueEnrollmentToken: %v", err)
+	}
+	id, token, err = st.Enroll(ctx, enroll, "test", "amd64", "test")
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	return id, token
+}
+
+func TestEnrollTokenCommand(t *testing.T) {
+	dir := t.TempDir()
+	var out bytes.Buffer
+	if err := runEnrollToken([]string{"-data-dir", dir}, &out); err != nil {
+		t.Fatalf("runEnrollToken: %v", err)
+	}
+	tok := strings.TrimSpace(out.String())
+	if tok == "" {
+		t.Fatal("empty token")
+	}
+	st, err := store.Open(context.Background(), filepath.Join(dir, "forge.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	id, machine, err := st.Enroll(context.Background(), tok, "cli", "amd64", "test")
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if id == "" || machine == "" {
+		t.Fatal("empty enroll result")
+	}
 }

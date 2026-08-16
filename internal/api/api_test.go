@@ -21,7 +21,19 @@ import (
 	"github.com/alicebob/miniredis/v2"
 )
 
-const testToken = "agent-token"
+func enrollWorker(t *testing.T, st *store.Store) (id, token string) {
+	t.Helper()
+	ctx := context.Background()
+	enroll, err := st.IssueEnrollmentToken(ctx)
+	if err != nil {
+		t.Fatalf("IssueEnrollmentToken: %v", err)
+	}
+	id, token, err = st.Enroll(ctx, enroll, "test", "amd64", "test")
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	return id, token
+}
 
 type fakeSource struct {
 	mu          sync.Mutex
@@ -106,7 +118,6 @@ func openAPI(t *testing.T, src *fakeSource) (*store.Store, *stream.Stream, strin
 		Stream:    jobs,
 		Store:     st,
 		Source:    src,
-		Token:     testToken,
 		Image:     "alpine:3.20",
 		Command:   []string{"true"},
 		LogDir:    logDir,
@@ -117,7 +128,8 @@ func openAPI(t *testing.T, src *fakeSource) (*store.Store, *stream.Stream, strin
 	h.Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	c := &Client{BaseURL: srv.URL, Token: testToken, WorkerID: "w1", HTTP: srv.Client()}
+	id, tok := enrollWorker(t, st)
+	c := &Client{BaseURL: srv.URL, Token: tok, WorkerID: id, HTTP: srv.Client()}
 	return st, jobs, logDir, c, src
 }
 
@@ -133,7 +145,7 @@ func putQueued(t *testing.T, st *store.Store, jobs *stream.Stream, j *job.Job) {
 
 func TestClaimUnauthorized(t *testing.T) {
 	_, _, _, c, _ := openAPI(t, nil)
-	req, _ := http.NewRequest(http.MethodGet, c.BaseURL+"/v1/agents/w1/claim", nil)
+	req, _ := http.NewRequest(http.MethodGet, c.BaseURL+"/v1/agents/"+c.WorkerID+"/claim", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -141,6 +153,79 @@ func TestClaimUnauthorized(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestClaimWrongWorkerID(t *testing.T) {
+	_, _, _, c, _ := openAPI(t, nil)
+	c.WorkerID = "not-me"
+	_, err := c.Claim(context.Background())
+	if err == nil {
+		t.Fatal("expected error for mismatched worker id")
+	}
+}
+
+func TestClaimRemovedWorker(t *testing.T) {
+	st, _, _, c, _ := openAPI(t, nil)
+	if err := st.SetWorkerState(context.Background(), c.WorkerID, job.WorkerRemoved); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.Claim(context.Background())
+	if err == nil {
+		t.Fatal("expected error for removed worker")
+	}
+}
+
+func TestClaimCordonedWorker(t *testing.T) {
+	st, _, _, c, _ := openAPI(t, nil)
+	if err := st.SetWorkerState(context.Background(), c.WorkerID, job.WorkerCordoned); err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, c.BaseURL+"/v1/agents/"+c.WorkerID+"/claim", nil)
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+}
+
+func TestEnrollHTTP(t *testing.T) {
+	st, _, _, c, _ := openAPI(t, nil)
+	tok, err := st.IssueEnrollmentToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	anon := &Client{BaseURL: c.BaseURL, HTTP: c.HTTP}
+	got, err := anon.Enroll(context.Background(), tok, "host-b", "arm64", "test")
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	if got.WorkerID == "" || got.Token == "" {
+		t.Fatalf("enroll = %+v", got)
+	}
+	w, err := st.GetWorker(context.Background(), got.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.State != job.WorkerActive || w.Name != "host-b" {
+		t.Fatalf("worker = %+v", w)
+	}
+	_, err = anon.Enroll(context.Background(), tok, "host-c", "arm64", "test")
+	if err == nil {
+		t.Fatal("expected second enroll to fail")
+	}
+}
+
+func TestEnrollRejectsUnknownToken(t *testing.T) {
+	_, _, _, c, _ := openAPI(t, nil)
+	anon := &Client{BaseURL: c.BaseURL, HTTP: c.HTTP}
+	_, err := anon.Enroll(context.Background(), "nope", "h", "amd64", "test")
+	if err == nil {
+		t.Fatal("expected error")
 	}
 }
 
@@ -161,7 +246,7 @@ func TestClaimAssignsAndReturnsJIT(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row.State != job.JobAssigned || row.WorkerID != "w1" || row.Attempt != 1 {
+	if row.State != job.JobAssigned || row.WorkerID != c.WorkerID || row.Attempt != 1 {
 		t.Fatalf("job = %+v", row)
 	}
 }
@@ -261,5 +346,20 @@ func TestStaleAttemptRejected(t *testing.T) {
 	err = c.Status(context.Background(), cl.JobID, cl.Attempt+1, StatusReport{State: job.JobRunning})
 	if err == nil {
 		t.Fatal("expected error for stale attempt")
+	}
+}
+
+func TestStatusWrongWorker(t *testing.T) {
+	st, jobs, _, c, _ := openAPI(t, nil)
+	putQueued(t, st, jobs, testJob("job-fence", 6))
+	cl, err := c.Claim(context.Background())
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	id2, tok2 := enrollWorker(t, st)
+	other := &Client{BaseURL: c.BaseURL, Token: tok2, WorkerID: id2, HTTP: c.HTTP}
+	err = other.Status(context.Background(), cl.JobID, cl.Attempt, StatusReport{State: job.JobRunning})
+	if err == nil {
+		t.Fatal("expected error for other worker")
 	}
 }

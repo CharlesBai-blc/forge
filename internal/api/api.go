@@ -6,6 +6,20 @@ import (
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
 )
 
+// EnrollRequest is the body of POST /v1/agents/enroll (FR-3).
+type EnrollRequest struct {
+	Token   string `json:"token"`
+	Name    string `json:"name"`
+	Arch    string `json:"arch"`
+	Version string `json:"version"`
+}
+
+// EnrollResponse is the per-machine credential issued at enrollment.
+type EnrollResponse struct {
+	WorkerID string `json:"worker_id"`
+	Token    string `json:"token"`
+}
+
 // ClaimResponse is delivered when the long-poll matches a job.
 type ClaimResponse struct {
 	JobID   string       `json:"job_id"`

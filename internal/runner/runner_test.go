@@ -173,7 +173,6 @@ func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *stream.Stream
 		Stream:    jobs,
 		Store:     st,
 		Source:    src,
-		Token:     "tok",
 		Image:     "alpine:3.20",
 		Command:   []string{"true"},
 		LogDir:    logDir,
@@ -184,12 +183,27 @@ func openHarness(t *testing.T, p sandbox.Provider) (*store.Store, *stream.Stream
 	h.Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
+	id, tok := enrollWorker(t, st)
 	r := &Runner{
-		Client:   &api.Client{BaseURL: srv.URL, Token: "tok", WorkerID: "w1", HTTP: srv.Client()},
+		Client:   &api.Client{BaseURL: srv.URL, Token: tok, WorkerID: id, HTTP: srv.Client()},
 		Provider: p,
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	return st, jobs, r, src, logDir
+}
+
+func enrollWorker(t *testing.T, st *store.Store) (id, token string) {
+	t.Helper()
+	ctx := context.Background()
+	enroll, err := st.IssueEnrollmentToken(ctx)
+	if err != nil {
+		t.Fatalf("IssueEnrollmentToken: %v", err)
+	}
+	id, token, err = st.Enroll(ctx, enroll, "test", "amd64", "test")
+	if err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	return id, token
 }
 
 func waitState(t *testing.T, st *store.Store, id string, want job.JobState) *job.Job {
