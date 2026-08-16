@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"io"
 	"log/slog"
@@ -30,8 +29,6 @@ import (
 	"github.com/CharlesBai-blc/forge/internal/secret"
 	"github.com/CharlesBai-blc/forge/internal/source/github"
 	"github.com/CharlesBai-blc/forge/internal/store"
-
-	_ "modernc.org/sqlite"
 )
 
 const testSecret = "test-secret"
@@ -304,13 +301,9 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 		appCancel()
 		t.Fatalf("newApp: %v", err)
 	}
-	t.Cleanup(func() {
-		appCancel()
-		a.Close()
-	})
+	a.api.ClaimWait = 50 * time.Millisecond
 
 	srv := httptest.NewServer(a.mux)
-	t.Cleanup(srv.Close)
 
 	id, tok := enrollWorker(t, a.store)
 	agent := &runner.Runner{
@@ -318,7 +311,22 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 		Provider: prov,
 		Log:      log,
 	}
-	go func() { _ = agent.Run(appCtx) }()
+	agentDone := make(chan struct{})
+	go func() {
+		defer close(agentDone)
+		_ = agent.Run(appCtx)
+	}()
+	t.Cleanup(func() {
+		appCancel()
+		select {
+		case <-agentDone:
+		case <-time.After(time.Second):
+			t.Error("agent did not stop")
+		}
+		srv.Close()
+		_ = prov.Close()
+		_ = a.Close()
+	})
 
 	body := []byte(`{
 		"action": "queued",
@@ -340,7 +348,7 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
 	}
 
-	state, jobID := waitJobState(t, cfg.dataDir, job.JobSucceeded, job.JobFailed)
+	state, jobID := waitJobState(t, a.store, job.JobSucceeded, job.JobFailed)
 	if state != job.JobSucceeded {
 		t.Fatalf("state = %s, want succeeded (job %s)", state, jobID)
 	}
@@ -355,29 +363,29 @@ func TestWebhookRunsJobAndDestroysSandbox(t *testing.T) {
 	waitContainersGone(t, cli, ids)
 }
 
-func waitJobState(t *testing.T, dataDir string, want ...job.JobState) (job.JobState, string) {
+func waitJobState(t *testing.T, st *store.Store, want ...job.JobState) (job.JobState, string) {
 	t.Helper()
-	path := filepath.Join(dataDir, "forge.db")
 	allowed := make(map[job.JobState]bool, len(want))
 	for _, s := range want {
 		allowed[s] = true
 	}
+	var (
+		lastState job.JobState
+		lastErr   error
+	)
 	deadline := time.Now().Add(2 * time.Minute)
 	for time.Now().Before(deadline) {
-		db, err := sql.Open("sqlite", path)
-		if err != nil {
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
-		var id, state string
-		err = db.QueryRow(`SELECT id, state FROM jobs LIMIT 1`).Scan(&id, &state)
-		db.Close()
-		if err == nil && allowed[job.JobState(state)] {
-			return job.JobState(state), id
+		jobs, err := st.ListJobs(context.Background(), 1)
+		lastErr = err
+		if err == nil && len(jobs) == 1 {
+			lastState = jobs[0].State
+			if allowed[lastState] {
+				return lastState, jobs[0].ID
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("job did not reach %v", want)
+	t.Fatalf("job did not reach %v: last state %q, last error %v", want, lastState, lastErr)
 	return "", ""
 }
 
