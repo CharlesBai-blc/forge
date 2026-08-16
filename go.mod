@@ -4,6 +4,7 @@ go 1.26.6
 
 require (
 	github.com/docker/docker v27.5.1+incompatible
+	golang.org/x/crypto v0.55.0
 	modernc.org/sqlite v1.56.0
 )
 

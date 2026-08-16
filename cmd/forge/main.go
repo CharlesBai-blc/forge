@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -18,6 +19,7 @@ import (
 	"github.com/CharlesBai-blc/forge/internal/runner"
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
 	dockersandbox "github.com/CharlesBai-blc/forge/internal/sandbox/docker"
+	"github.com/CharlesBai-blc/forge/internal/secret"
 	"github.com/CharlesBai-blc/forge/internal/source"
 	"github.com/CharlesBai-blc/forge/internal/source/github"
 	"github.com/CharlesBai-blc/forge/internal/store"
@@ -84,12 +86,6 @@ func (c config) validate() error {
 	if len(c.command) == 0 {
 		return fmt.Errorf("forge: -command is required")
 	}
-	if c.webhookSecret == "" {
-		return fmt.Errorf("forge: -webhook-secret is required")
-	}
-	if c.githubToken == "" {
-		return fmt.Errorf("forge: -github-token is required")
-	}
 	if c.githubOrg == "" && (c.githubOwner == "" || c.githubRepo == "") {
 		return fmt.Errorf("forge: -github-owner and -github-repo, or -github-org, are required")
 	}
@@ -97,6 +93,57 @@ func (c config) validate() error {
 		return fmt.Errorf("forge: -data-dir is required")
 	}
 	return nil
+}
+
+func (c config) validateCreds() error {
+	if c.webhookSecret == "" {
+		return fmt.Errorf("forge: -webhook-secret is required")
+	}
+	if c.githubToken == "" {
+		return fmt.Errorf("forge: -github-token is required")
+	}
+	return nil
+}
+
+const (
+	secretWebhook = "webhook_secret"
+	secretToken   = "github_token"
+)
+
+func resolveCreds(ctx context.Context, st *store.Store, key *[secret.KeySize]byte, cfg config) (config, error) {
+	var err error
+	if cfg.webhookSecret, err = resolveOne(ctx, st, key, secretWebhook, cfg.webhookSecret); err != nil {
+		return cfg, err
+	}
+	if cfg.githubToken, err = resolveOne(ctx, st, key, secretToken, cfg.githubToken); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+func resolveOne(ctx context.Context, st *store.Store, key *[secret.KeySize]byte, name, provided string) (string, error) {
+	if provided != "" {
+		box, err := secret.Seal(key, []byte(provided))
+		if err != nil {
+			return "", err
+		}
+		if err := st.PutSecret(ctx, name, box); err != nil {
+			return "", err
+		}
+		return provided, nil
+	}
+	box, err := st.GetSecret(ctx, name)
+	if errors.Is(err, store.ErrSecretNotFound) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	pt, err := secret.Open(key, box)
+	if err != nil {
+		return "", err
+	}
+	return string(pt), nil
 }
 
 type app struct {
@@ -107,15 +154,34 @@ type app struct {
 }
 
 func newApp(ctx context.Context, cfg config, log *slog.Logger, provider sandbox.Provider, src source.RunnerSource) (*app, error) {
-	if src == nil {
-		return nil, fmt.Errorf("forge: source required")
-	}
 	if err := os.MkdirAll(cfg.dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("forge: data dir: %w", err)
+	}
+	key, err := secret.LoadOrCreate(cfg.dataDir)
+	if err != nil {
+		return nil, err
 	}
 	st, err := store.Open(ctx, filepath.Join(cfg.dataDir, "forge.db"))
 	if err != nil {
 		return nil, err
+	}
+	cfg, err = resolveCreds(ctx, st, key, cfg)
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
+	if src == nil {
+		if err := cfg.validateCreds(); err != nil {
+			st.Close()
+			return nil, err
+		}
+		src = &github.Source{
+			Secret: cfg.webhookSecret,
+			Token:  cfg.githubToken,
+			Owner:  cfg.githubOwner,
+			Repo:   cfg.githubRepo,
+			Org:    cfg.githubOrg,
+		}
 	}
 	q := queue.New()
 	r := &runner.Runner{
@@ -156,14 +222,7 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	src := &github.Source{
-		Secret: cfg.webhookSecret,
-		Token:  cfg.githubToken,
-		Owner:  cfg.githubOwner,
-		Repo:   cfg.githubRepo,
-		Org:    cfg.githubOrg,
-	}
-	a, err := newApp(ctx, cfg, log, p, src)
+	a, err := newApp(ctx, cfg, log, p, nil)
 	if err != nil {
 		p.Close()
 		return err

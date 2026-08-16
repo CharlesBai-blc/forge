@@ -39,8 +39,8 @@ func TestOpenAppliesMigration(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&version); err != nil {
 		t.Fatalf("read schema_version: %v", err)
 	}
-	if version != 1 {
-		t.Errorf("schema_version = %d, want 1", version)
+	if version != 2 {
+		t.Errorf("schema_version = %d, want 2", version)
 	}
 }
 
@@ -249,5 +249,42 @@ func TestCreateJobDuplicateExternalIDRejected(t *testing.T) {
 	dup := testJob("job-2")
 	if err := s.CreateJob(ctx, dup); err == nil {
 		t.Fatal("expected error for duplicate (source, external_id)")
+	}
+}
+
+func TestPutGetSecret(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	box := []byte{1, 2, 3, 4}
+
+	if err := s.PutSecret(ctx, "webhook_secret", box); err != nil {
+		t.Fatalf("PutSecret: %v", err)
+	}
+	got, err := s.GetSecret(ctx, "webhook_secret")
+	if err != nil {
+		t.Fatalf("GetSecret: %v", err)
+	}
+	if string(got) != string(box) {
+		t.Fatalf("got %v, want %v", got, box)
+	}
+
+	next := []byte{9, 9}
+	if err := s.PutSecret(ctx, "webhook_secret", next); err != nil {
+		t.Fatalf("PutSecret update: %v", err)
+	}
+	got, err = s.GetSecret(ctx, "webhook_secret")
+	if err != nil {
+		t.Fatalf("GetSecret after update: %v", err)
+	}
+	if string(got) != string(next) {
+		t.Fatalf("got %v, want %v", got, next)
+	}
+}
+
+func TestGetSecretMissing(t *testing.T) {
+	s := openTestStore(t)
+	_, err := s.GetSecret(context.Background(), "missing")
+	if err == nil {
+		t.Fatal("expected error")
 	}
 }

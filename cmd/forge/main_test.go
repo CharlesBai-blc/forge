@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -23,7 +24,9 @@ import (
 	"github.com/CharlesBai-blc/forge/internal/job"
 	"github.com/CharlesBai-blc/forge/internal/sandbox"
 	dockersandbox "github.com/CharlesBai-blc/forge/internal/sandbox/docker"
+	"github.com/CharlesBai-blc/forge/internal/secret"
 	"github.com/CharlesBai-blc/forge/internal/source/github"
+	"github.com/CharlesBai-blc/forge/internal/store"
 
 	_ "modernc.org/sqlite"
 )
@@ -90,6 +93,69 @@ func TestValidateRequiredFlags(t *testing.T) {
 	}
 	if err := ok.validate(); err != nil {
 		t.Fatalf("validate: %v", err)
+	}
+}
+
+func TestValidateCredsRequired(t *testing.T) {
+	cfg := config{webhookSecret: "s"}
+	if err := cfg.validateCreds(); err == nil {
+		t.Fatal("expected error for missing token")
+	}
+	cfg = config{githubToken: "tok"}
+	if err := cfg.validateCreds(); err == nil {
+		t.Fatal("expected error for missing webhook secret")
+	}
+	cfg = config{webhookSecret: "s", githubToken: "tok"}
+	if err := cfg.validateCreds(); err != nil {
+		t.Fatalf("validateCreds: %v", err)
+	}
+}
+
+func TestResolveCredsPersistsEncrypted(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	key, err := secret.LoadOrCreate(dir)
+	if err != nil {
+		t.Fatalf("LoadOrCreate: %v", err)
+	}
+	st, err := store.Open(ctx, filepath.Join(dir, "forge.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	const webhook, token = "super-secret-webhook", "ghp_plaintext_token"
+	got, err := resolveCreds(ctx, st, key, config{webhookSecret: webhook, githubToken: token})
+	if err != nil {
+		t.Fatalf("resolveCreds: %v", err)
+	}
+	if got.webhookSecret != webhook || got.githubToken != token {
+		t.Fatalf("resolved = %+v", got)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "forge.db"))
+	if err != nil {
+		t.Fatalf("read db: %v", err)
+	}
+	if bytes.Contains(raw, []byte(webhook)) || bytes.Contains(raw, []byte(token)) {
+		t.Fatal("plaintext credential found in database file")
+	}
+
+	st.Close()
+	st2, err := store.Open(ctx, filepath.Join(dir, "forge.db"))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { st2.Close() })
+	key2, err := secret.LoadOrCreate(dir)
+	if err != nil {
+		t.Fatalf("reload key: %v", err)
+	}
+	loaded, err := resolveCreds(ctx, st2, key2, config{})
+	if err != nil {
+		t.Fatalf("reload creds: %v", err)
+	}
+	if loaded.webhookSecret != webhook || loaded.githubToken != token {
+		t.Fatalf("loaded = %+v", loaded)
 	}
 }
 
