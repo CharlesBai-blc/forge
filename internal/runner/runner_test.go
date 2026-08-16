@@ -464,6 +464,7 @@ func TestRunStreamsLogsWhileRunning(t *testing.T) {
 	}
 
 	pw.Close()
+	sb.logs = "tick-1\n"
 	sb.waitCh <- 0
 	waitState(t, st, j.ID, job.JobSucceeded)
 	b, err := os.ReadFile(logPath)

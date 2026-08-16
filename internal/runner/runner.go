@@ -195,11 +195,11 @@ func (r *Runner) runOne(ctx context.Context, cl *api.ClaimResponse) {
 
 	stop := r.startLogStream(ctx, sb, cl)
 	code, waitErr := sb.Wait(ctx)
-	if !stop() {
-		// The live stream did not complete cleanly; re-upload the full
-		// log so the stored copy is complete (FR-26).
-		r.uploadLogs(context.Background(), sb, cl)
-	}
+	_ = stop()
+	// Snapshot is the durable copy (FR-26). Live chunks may have already
+	// landed; this replaces them with the full log, including empty jobs
+	// that produced no follow-mode bytes.
+	r.uploadLogs(context.Background(), sb, cl)
 	if waitErr != nil {
 		report(api.StatusReport{State: job.JobFailed, Reason: waitErr.Error()})
 		return
@@ -257,8 +257,7 @@ func (r *Runner) flushStatus(ctx context.Context) error {
 
 // startLogStream copies the sandbox's combined output to the control
 // plane in chunks while the job runs (FR-24, tdd.md §4.8). The returned
-// stop joins the stream and reports whether every chunk was delivered;
-// on false the caller uploads a full snapshot instead.
+// stop joins the stream. The caller then uploads a full snapshot.
 func (r *Runner) startLogStream(ctx context.Context, sb sandbox.Sandbox, cl *api.ClaimResponse) (stop func() bool) {
 	rc, err := sb.Logs(ctx, true)
 	if err != nil {
