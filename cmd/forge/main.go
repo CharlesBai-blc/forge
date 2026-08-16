@@ -57,7 +57,7 @@ func parseFlags() config {
 	githubRepo := flag.String("github-repo", envOr("FORGE_GITHUB_REPO", ""), "GitHub repo name")
 	githubOrg := flag.String("github-org", envOr("FORGE_GITHUB_ORG", ""), "GitHub org (org-level registration)")
 	image := flag.String("image", envOr("FORGE_JOB_IMAGE", ""), "sandbox image")
-	command := flag.String("command", envOr("FORGE_JOB_COMMAND", ""), "command to run in the sandbox")
+	command := flag.String("command", envOr("FORGE_JOB_COMMAND", ""), "sandbox command; default is actions/runner JIT")
 	flag.Parse()
 	return config{
 		addr:          *addr,
@@ -79,12 +79,18 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// jobCommand is the sandbox process. Empty means the official
+// actions/runner JIT invocation (FR-6).
+func jobCommand(cmd []string) []string {
+	if len(cmd) > 0 {
+		return cmd
+	}
+	return []string{"sh", "-c", `./run.sh --jitconfig "$(cat /jitconfig)"`}
+}
+
 func (c config) validate() error {
 	if c.image == "" {
 		return fmt.Errorf("forge: -image is required")
-	}
-	if len(c.command) == 0 {
-		return fmt.Errorf("forge: -command is required")
 	}
 	if c.githubOrg == "" && (c.githubOwner == "" || c.githubRepo == "") {
 		return fmt.Errorf("forge: -github-owner and -github-repo, or -github-org, are required")
@@ -191,7 +197,7 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, provider sandbox.
 		Source:   src,
 		Log:      log,
 		Image:    cfg.image,
-		Command:  cfg.command,
+		Command:  jobCommand(cfg.command),
 		LogDir:   filepath.Join(cfg.dataDir, "logs"),
 	}
 	h := &webhookHandler{

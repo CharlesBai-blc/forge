@@ -94,6 +94,23 @@ func TestValidateRequiredFlags(t *testing.T) {
 	if err := ok.validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
+	ok.command = nil
+	if err := ok.validate(); err != nil {
+		t.Fatalf("validate without command: %v", err)
+	}
+}
+
+func TestJobCommandDefaultsToRunnerJIT(t *testing.T) {
+	got := jobCommand(nil)
+	if len(got) != 3 || got[0] != "sh" || got[1] != "-c" {
+		t.Fatalf("jobCommand(nil) = %v", got)
+	}
+	if got[2] != `./run.sh --jitconfig "$(cat /jitconfig)"` {
+		t.Fatalf("script = %q", got[2])
+	}
+	if got := jobCommand([]string{"true"}); len(got) != 1 || got[0] != "true" {
+		t.Fatalf("jobCommand(true) = %v", got)
+	}
 }
 
 func TestValidateCredsRequired(t *testing.T) {

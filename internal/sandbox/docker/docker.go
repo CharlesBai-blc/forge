@@ -128,7 +128,7 @@ func (s *dockerSandbox) copyJIT(ctx context.Context, encoded string) error {
 	b := []byte(encoded)
 	if err := tw.WriteHeader(&tar.Header{
 		Name: jitPath,
-		Mode: 0o600,
+		Mode: 0o644, // actions/runner runs as uid 1001; 0600 would be unreadable
 		Size: int64(len(b)),
 	}); err != nil {
 		return fmt.Errorf("docker: jit tar: %w", err)
