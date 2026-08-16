@@ -2,6 +2,8 @@
 package docker
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -20,6 +22,8 @@ var (
 	_ sandbox.Provider = (*Provider)(nil)
 	_ sandbox.Sandbox  = (*dockerSandbox)(nil)
 )
+
+const jitPath = "jitconfig"
 
 // Provider drives container lifecycle via the Docker Engine API.
 type Provider struct {
@@ -98,17 +102,46 @@ type dockerSandbox struct {
 
 func (s *dockerSandbox) ID() string { return s.containerID }
 
-// Start starts the container. Errors if called twice.
-func (s *dockerSandbox) Start(ctx context.Context) error {
+// Start starts the container. If jitEncoded is non-empty, it is copied
+// in as /jitconfig first (FR-4). Errors if called twice.
+func (s *dockerSandbox) Start(ctx context.Context, jitEncoded string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.started {
 		return fmt.Errorf("docker: sandbox %s already started", s.containerID)
 	}
+	if jitEncoded != "" {
+		if err := s.copyJIT(ctx, jitEncoded); err != nil {
+			return err
+		}
+	}
 	if err := s.cli.ContainerStart(ctx, s.containerID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("docker: start: %w", err)
 	}
 	s.started = true
+	return nil
+}
+
+func (s *dockerSandbox) copyJIT(ctx context.Context, encoded string) error {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	b := []byte(encoded)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: jitPath,
+		Mode: 0o600,
+		Size: int64(len(b)),
+	}); err != nil {
+		return fmt.Errorf("docker: jit tar: %w", err)
+	}
+	if _, err := tw.Write(b); err != nil {
+		return fmt.Errorf("docker: jit tar: %w", err)
+	}
+	if err := tw.Close(); err != nil {
+		return fmt.Errorf("docker: jit tar: %w", err)
+	}
+	if err := s.cli.CopyToContainer(ctx, s.containerID, "/", &buf, container.CopyToContainerOptions{}); err != nil {
+		return fmt.Errorf("docker: copy jit: %w", err)
+	}
 	return nil
 }
 

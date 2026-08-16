@@ -8,7 +8,7 @@ import (
 )
 
 // Spec is the per-job sandbox configuration.
-// Command is the M1 fixed command (FR-8). Hardened is unused until M4.
+// Command is the process to run. Hardened is unused until M4.
 type Spec struct {
 	Image       string
 	Command     []string
@@ -26,12 +26,12 @@ type Provider interface {
 }
 
 // Sandbox is a single-use job execution environment.
-// M1 Start runs Spec.Command; JIT credential injection is M2.
 type Sandbox interface {
 	ID() string
 
-	// Start launches the configured command. Errors if called twice.
-	Start(ctx context.Context) error
+	// Start launches Spec.Command. If jitEncoded is non-empty, it is
+	// written into the sandbox first (FR-4). Errors if called twice.
+	Start(ctx context.Context, jitEncoded string) error
 
 	// Wait blocks until the process exits and returns its exit code.
 	Wait(ctx context.Context) (int, error)

@@ -16,7 +16,7 @@ type fakeSandbox struct {
 
 func (s *fakeSandbox) ID() string { return s.id }
 
-func (s *fakeSandbox) Start(context.Context) error {
+func (s *fakeSandbox) Start(context.Context, string) error {
 	if s.dead {
 		return fmt.Errorf("sandbox: destroyed")
 	}
@@ -59,10 +59,10 @@ func TestStartTwiceErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := sb.Start(context.Background()); err != nil {
+	if err := sb.Start(context.Background(), ""); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if err := sb.Start(context.Background()); err == nil {
+	if err := sb.Start(context.Background(), ""); err == nil {
 		t.Fatal("expected error on second Start")
 	}
 }

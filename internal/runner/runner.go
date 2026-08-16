@@ -59,7 +59,7 @@ func (r *Runner) runOne(ctx context.Context, j *job.Job) {
 
 	r.transition(storeCtx, j.ID, job.JobAssigned, "")
 
-	if err := sb.Start(ctx); err != nil {
+	if err := sb.Start(ctx, ""); err != nil {
 		r.transition(storeCtx, j.ID, job.JobLost, "start: "+err.Error())
 		r.transition(storeCtx, j.ID, job.JobFailed, "start: "+err.Error())
 		return

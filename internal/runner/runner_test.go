@@ -27,7 +27,7 @@ type fakeSandbox struct {
 
 func (s *fakeSandbox) ID() string { return s.id }
 
-func (s *fakeSandbox) Start(context.Context) error {
+func (s *fakeSandbox) Start(context.Context, string) error {
 	if s.started {
 		return fmt.Errorf("already started")
 	}
