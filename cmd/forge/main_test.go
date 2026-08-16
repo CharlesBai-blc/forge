@@ -441,3 +441,60 @@ func TestEnrollTokenCommand(t *testing.T) {
 		t.Fatal("empty enroll result")
 	}
 }
+
+func TestFleetCommands(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(dir, "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, tok, err := func() (string, string, error) {
+		enroll, err := st.IssueEnrollmentToken(ctx)
+		if err != nil {
+			return "", "", err
+		}
+		return st.Enroll(ctx, enroll, "host-a", "amd64", "test")
+	}()
+	st.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runCordon([]string{"-data-dir", dir, id}, &out); err != nil {
+		t.Fatalf("cordon: %v", err)
+	}
+	if err := runUncordon([]string{"-data-dir", dir, id}, io.Discard); err != nil {
+		t.Fatalf("uncordon: %v", err)
+	}
+	if err := runDrain([]string{"-data-dir", dir, id}, io.Discard); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if err := runRemove([]string{"-data-dir", dir, id}, io.Discard); err == nil {
+		t.Fatal("expected remove of draining worker to fail")
+	}
+	if err := runCordon([]string{"-data-dir", dir, id}, io.Discard); err != nil {
+		t.Fatalf("cordon after drain: %v", err)
+	}
+	if err := runRemove([]string{"-data-dir", dir, id}, io.Discard); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	out.Reset()
+	if err := runWorkers([]string{"-data-dir", dir}, &out); err != nil {
+		t.Fatalf("workers: %v", err)
+	}
+	if !strings.Contains(out.String(), id) || !strings.Contains(out.String(), "removed") {
+		t.Fatalf("workers = %q", out.String())
+	}
+
+	st2, err := store.Open(ctx, filepath.Join(dir, "forge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st2.Close() })
+	if _, err := st2.WorkerByToken(ctx, tok); err != store.ErrWorkerNotFound {
+		t.Fatalf("token after remove = %v, want ErrWorkerNotFound", err)
+	}
+}

@@ -306,6 +306,52 @@ func (s *Store) Requeue(ctx context.Context, jobID string) error {
 	return tx.Commit()
 }
 
+// DrainRequeue returns an assigned-not-started job to queued without
+// consuming an attempt (FR-19).
+func (s *Store) DrainRequeue(ctx context.Context, jobID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("store: begin drain requeue: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		from    job.JobState
+		attempt int
+	)
+	err = tx.QueryRowContext(ctx, `SELECT state, attempt FROM jobs WHERE id = ?`, jobID).Scan(&from, &attempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("store: job %s not found", jobID)
+	}
+	if err != nil {
+		return fmt.Errorf("store: select job: %w", err)
+	}
+	if from != job.JobAssigned {
+		return fmt.Errorf("store: drain requeue %s: state %s, want %s", jobID, from, job.JobAssigned)
+	}
+	if err := job.ValidateTransition(from, job.JobQueued); err != nil {
+		return err
+	}
+	if attempt > 0 {
+		attempt--
+	}
+	now := formatTime(time.Now().UTC())
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE jobs SET state = ?, attempt = ?, worker_id = NULL, reason = ?, updated_at = ? WHERE id = ?`,
+		string(job.JobQueued), attempt, "drain", now, jobID,
+	); err != nil {
+		return fmt.Errorf("store: drain requeue update: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO transitions (job_id, attempt, from_state, to_state, reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		jobID, attempt, string(from), string(job.JobQueued), "drain", now,
+	); err != nil {
+		return fmt.Errorf("store: drain requeue transition: %w", err)
+	}
+	return tx.Commit()
+}
+
 // DeadLetter marks a lost job failed with DeadLettered set (FR-12).
 func (s *Store) DeadLetter(ctx context.Context, jobID, reason string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -368,37 +414,61 @@ func (s *Store) QueuedIDs(ctx context.Context) ([]string, error) {
 
 // GetJob returns a job by ID.
 func (s *Store) GetJob(ctx context.Context, id string) (*job.Job, error) {
-	var (
-		j                    job.Job
-		labels               string
-		deadLettered         int
-		createdAt, updatedAt string
-	)
-
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id, source, external_id, repo, run_id, labels, state, attempt, COALESCE(worker_id, ''), dead_lettered, COALESCE(reason, ''), created_at, updated_at
-		FROM jobs WHERE id = ?`, id,
-	).Scan(&j.ID, &j.Source, &j.ExternalID, &j.Repo, &j.RunID, &labels, &j.State, &j.Attempt,
-		&j.WorkerID, &deadLettered, &j.Reason, &createdAt, &updatedAt)
+	j, err := scanJob(s.db.QueryRowContext(ctx, `SELECT `+jobCols+` FROM jobs WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("store: job %s not found", id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("store: select job: %w", err)
 	}
+	return j, nil
+}
 
+// JobsByWorker returns jobs for workerID in state.
+func (s *Store) JobsByWorker(ctx context.Context, workerID string, state job.JobState) ([]*job.Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobCols+` FROM jobs WHERE worker_id = ? AND state = ?`, workerID, string(state))
+	if err != nil {
+		return nil, fmt.Errorf("store: jobs by worker: %w", err)
+	}
+	defer rows.Close()
+	var out []*job.Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: jobs by worker: %w", err)
+	}
+	return out, nil
+}
+
+const jobCols = `id, source, external_id, repo, run_id, labels, state, attempt, COALESCE(worker_id, ''), dead_lettered, COALESCE(reason, ''), created_at, updated_at`
+
+func scanJob(row scanner) (*job.Job, error) {
+	var (
+		j                    job.Job
+		labels               string
+		deadLettered         int
+		createdAt, updatedAt string
+	)
+	err := row.Scan(&j.ID, &j.Source, &j.ExternalID, &j.Repo, &j.RunID, &labels, &j.State, &j.Attempt,
+		&j.WorkerID, &deadLettered, &j.Reason, &createdAt, &updatedAt)
+	if err != nil {
+		return nil, err
+	}
 	if err := json.Unmarshal([]byte(labels), &j.Labels); err != nil {
 		return nil, fmt.Errorf("store: unmarshal labels: %w", err)
 	}
 	j.DeadLettered = deadLettered != 0
-
 	if j.CreatedAt, err = parseTime(createdAt); err != nil {
 		return nil, fmt.Errorf("store: parse created_at: %w", err)
 	}
 	if j.UpdatedAt, err = parseTime(updatedAt); err != nil {
 		return nil, fmt.Errorf("store: parse updated_at: %w", err)
 	}
-
 	return &j, nil
 }
 

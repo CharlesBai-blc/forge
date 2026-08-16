@@ -51,12 +51,16 @@ func (h *Handler) RunSweep(ctx context.Context) {
 	}
 }
 
-// Sweep marks stale workers lost and reclaims idle stream entries (FR-11, FR-20).
+// Sweep marks stale workers lost, reclaims idle stream entries, and
+// progresses drains (FR-11, FR-19, FR-20).
 func (h *Handler) Sweep(ctx context.Context) error {
 	if err := h.markLostWorkers(ctx); err != nil {
 		return err
 	}
-	return h.reclaimIdle(ctx)
+	if err := h.reclaimIdle(ctx); err != nil {
+		return err
+	}
+	return h.progressDrains(ctx)
 }
 
 func (h *Handler) markLostWorkers(ctx context.Context) error {
@@ -142,4 +146,63 @@ func (h *Handler) forgetMsg(jobID string) {
 	h.mu.Lock()
 	delete(h.msgs, jobID)
 	h.mu.Unlock()
+}
+
+func (h *Handler) progressDrains(ctx context.Context) error {
+	workers, err := h.Store.ListWorkers(ctx)
+	if err != nil {
+		return err
+	}
+	for _, w := range workers {
+		if w.State != job.WorkerDraining {
+			continue
+		}
+		assigned, err := h.Store.JobsByWorker(ctx, w.ID, job.JobAssigned)
+		if err != nil {
+			return err
+		}
+		for _, j := range assigned {
+			if err := h.drainAssigned(ctx, w.ID, j); err != nil {
+				h.log().Error("drain requeue", "job", j.ID, "err", err)
+			}
+		}
+		running, err := h.Store.JobsByWorker(ctx, w.ID, job.JobRunning)
+		if err != nil {
+			return err
+		}
+		if len(running) > 0 {
+			continue
+		}
+		if err := h.Store.TransitionWorker(ctx, w.ID, job.WorkerCordoned); err != nil {
+			h.log().Error("drain complete", "worker", w.ID, "err", err)
+		}
+	}
+	return nil
+}
+
+func (h *Handler) drainAssigned(ctx context.Context, workerID string, j *job.Job) error {
+	if err := h.Store.DrainRequeue(ctx, j.ID); err != nil {
+		return err
+	}
+	h.forgetJIT(j.ID, j.Attempt, true)
+	h.forgetMsg(j.ID)
+	pending, err := h.Stream.PendingFor(ctx, workerID)
+	if err != nil {
+		return err
+	}
+	acked := false
+	for _, msg := range pending {
+		if msg.JobID != j.ID {
+			continue
+		}
+		if err := h.Stream.Ack(ctx, msg.ID); err != nil {
+			return err
+		}
+		acked = true
+		break
+	}
+	if !acked {
+		h.log().Error("drain ack missing", "job", j.ID, "worker", workerID)
+	}
+	return h.Stream.Add(ctx, j.ID)
 }

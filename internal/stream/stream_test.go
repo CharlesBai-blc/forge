@@ -121,3 +121,29 @@ func TestAutoClaimIdlePending(t *testing.T) {
 		t.Fatalf("after ack AutoClaim = %+v", again)
 	}
 }
+
+func TestPendingFor(t *testing.T) {
+	s := testStream(t)
+	ctx := context.Background()
+	if err := s.Add(ctx, "job-1"); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := s.Claim(ctx, "w1", 50*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.PendingFor(ctx, "w1")
+	if err != nil {
+		t.Fatalf("PendingFor: %v", err)
+	}
+	if len(got) != 1 || got[0].JobID != "job-1" || got[0].ID != msg.ID {
+		t.Fatalf("PendingFor = %+v, want %+v", got, msg)
+	}
+	empty, err := s.PendingFor(ctx, "w2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("w2 pending = %+v", empty)
+	}
+}

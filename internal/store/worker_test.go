@@ -199,3 +199,65 @@ func TestRequeueAndDeadLetter(t *testing.T) {
 		t.Fatalf("dead letter = %+v", got)
 	}
 }
+
+func TestDrainRequeueDoesNotConsumeAttempt(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateJob(ctx, testJob("job-d")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Assign(ctx, "job-d", "w1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DrainRequeue(ctx, "job-d"); err != nil {
+		t.Fatalf("DrainRequeue: %v", err)
+	}
+	got, err := s.GetJob(ctx, "job-d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != job.JobQueued || got.WorkerID != "" || got.Attempt != 0 || got.Reason != "drain" {
+		t.Fatalf("drained = %+v", got)
+	}
+	assigned, err := s.Assign(ctx, "job-d", "w2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assigned.Attempt != 1 {
+		t.Fatalf("attempt = %d, want 1", assigned.Attempt)
+	}
+}
+
+func TestCordonDrainRemove(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	id, tok := enrollTest(t, s)
+	if err := s.TransitionWorker(ctx, id, job.WorkerCordoned); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TransitionWorker(ctx, id, job.WorkerActive); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.TransitionWorker(ctx, id, job.WorkerDraining); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveWorker(ctx, id); err == nil {
+		t.Fatal("expected error removing draining worker")
+	}
+	if err := s.TransitionWorker(ctx, id, job.WorkerCordoned); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveWorker(ctx, id); err != nil {
+		t.Fatalf("RemoveWorker: %v", err)
+	}
+	w, err := s.GetWorker(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.State != job.WorkerRemoved {
+		t.Fatalf("state = %s", w.State)
+	}
+	if _, err := s.WorkerByToken(ctx, tok); err != ErrWorkerNotFound {
+		t.Fatalf("WorkerByToken after remove = %v, want ErrWorkerNotFound", err)
+	}
+}
