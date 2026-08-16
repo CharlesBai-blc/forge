@@ -169,7 +169,6 @@ func (s *dockerSandbox) Logs(ctx context.Context) (io.ReadCloser, error) {
 	r, err := s.cli.ContainerLogs(ctx, s.containerID, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
-		Follow:     true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("docker: logs: %w", err)

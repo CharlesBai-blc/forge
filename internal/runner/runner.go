@@ -95,14 +95,8 @@ func (r *Runner) runOne(ctx context.Context, j *job.Job) {
 
 	r.transition(storeCtx, j.ID, job.JobRunning, "")
 
-	logsDone := make(chan struct{})
-	go func() {
-		defer close(logsDone)
-		r.writeLogs(ctx, sb, j)
-	}()
-
 	code, err := sb.Wait(ctx)
-	<-logsDone
+	r.writeLogs(context.Background(), sb, j)
 	if err != nil {
 		r.transition(storeCtx, j.ID, job.JobFailed, err.Error())
 		return
