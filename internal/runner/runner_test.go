@@ -394,3 +394,108 @@ func TestRunCancelled(t *testing.T) {
 	cancel := startRunner(t, r)
 	cancel()
 }
+
+type failStatusTransport struct {
+	inner http.RoundTripper
+	mu    sync.Mutex
+	fails int
+}
+
+func (t *failStatusTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(req.URL.Path, "/status") {
+		t.mu.Lock()
+		n := t.fails
+		if n > 0 {
+			t.fails--
+		}
+		t.mu.Unlock()
+		if n > 0 {
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Body:       io.NopCloser(strings.NewReader("unavailable")),
+				Header:     make(http.Header),
+				Request:    req,
+			}, nil
+		}
+	}
+	return t.inner.RoundTrip(req)
+}
+
+func TestStatusRetriesThenSucceeds(t *testing.T) {
+	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1"}}
+	st, jobs, r, _, _ := openHarness(t, p)
+	r.StatusBackoff = 10 * time.Millisecond
+	inner := r.Client.HTTP.Transport
+	if inner == nil {
+		inner = http.DefaultTransport
+	}
+	r.Client.HTTP.Transport = &failStatusTransport{inner: inner, fails: 1}
+	startRunner(t, r)
+
+	j := testJob("job-retry", 7)
+	if err := st.CreateJob(context.Background(), j); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if err := jobs.Add(context.Background(), j.ID); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	waitState(t, st, j.ID, job.JobSucceeded)
+}
+
+func TestStatusReplayFromOutbox(t *testing.T) {
+	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1"}}
+	st, _, r, _, _ := openHarness(t, p)
+	path := filepath.Join(t.TempDir(), "status.json")
+	box, err := OpenOutbox(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := testJob("job-replay", 8)
+	if err := st.CreateJob(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	assigned, err := st.Assign(context.Background(), j.ID, r.Client.WorkerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := box.Push(assigned.ID, assigned.Attempt, api.StatusReport{State: job.JobRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := box.Push(assigned.ID, assigned.Attempt, api.StatusReport{State: job.JobSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+	r.Outbox = box
+	r.StatusBackoff = 10 * time.Millisecond
+	startRunner(t, r)
+	waitState(t, st, j.ID, job.JobSucceeded)
+	if p.sb.started {
+		t.Fatal("sandbox started for replayed status")
+	}
+}
+
+func TestOutboxPersistsAcrossOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.json")
+	box, err := OpenOutbox(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := api.StatusReport{State: job.JobRunning}
+	if err := box.Push("job-1", 1, rep); err != nil {
+		t.Fatal(err)
+	}
+	got, err := OpenOutbox(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, ok := got.Peek()
+	if !ok || item.JobID != "job-1" || item.Attempt != 1 || item.Report.State != job.JobRunning {
+		t.Fatalf("peek = %+v ok=%v", item, ok)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode = %o, want 0600", info.Mode().Perm())
+	}
+}

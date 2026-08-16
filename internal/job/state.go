@@ -1,6 +1,12 @@
 package job
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrInvalidTransition is returned by ValidateTransition for illegal edges.
+var ErrInvalidTransition = errors.New("invalid transition")
 
 // transitions is the state machine from docs/design/tdd.md §4.2. It
 // covers the full diagram, including the lost/reclaim edges that are
@@ -22,5 +28,5 @@ func ValidateTransition(from, to JobState) error {
 	if transitions[from][to] {
 		return nil
 	}
-	return fmt.Errorf("invalid transition: %s -> %s", from, to)
+	return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, from, to)
 }

@@ -4,11 +4,34 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 )
+
+// StatusError is a control-plane HTTP failure for a status report.
+type StatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("api: status: status %d: %s", e.StatusCode, e.Body)
+}
+
+// StatusRetryable reports whether the agent should retry the status POST.
+func StatusRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.StatusCode >= 500 || se.StatusCode == http.StatusTooManyRequests
+	}
+	return true
+}
 
 // Client is forge-agent's view of the control plane.
 type Client struct {
@@ -99,7 +122,7 @@ func (c *Client) Status(ctx context.Context, jobID string, attempt int, rep Stat
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("api: status: status %d: %s", resp.StatusCode, bytes.TrimSpace(body))
+		return &StatusError{StatusCode: resp.StatusCode, Body: string(bytes.TrimSpace(body))}
 	}
 	return nil
 }
