@@ -112,6 +112,23 @@ func TestOtherEventNoContent(t *testing.T) {
 	}
 }
 
+func TestHostedQueuedJobIgnored(t *testing.T) {
+	called := false
+	h := testWebhook(func(*job.Job) error { called = true; return nil })
+	body := []byte(`{
+		"action": "queued",
+		"workflow_job": {"id": 11, "run_id": 22, "labels": ["ubuntu-latest"]},
+		"repository": {"full_name": "owner/name"}
+	}`)
+	rec := doWebhook(h, http.MethodPost, "workflow_job", signBody(testSecret, body), body)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if called {
+		t.Fatal("onJob called for ubuntu-latest job")
+	}
+}
+
 func TestCompletedActionNoContent(t *testing.T) {
 	called := false
 	h := testWebhook(func(*job.Job) error { called = true; return nil })
