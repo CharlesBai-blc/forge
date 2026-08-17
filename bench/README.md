@@ -1,0 +1,121 @@
+# bench
+
+Benchmark methodology and scripts (NFR-2). This directory holds the hosted
+vs Forge CI speedup. Reclaim latency and idempotent claiming (FR-11) live
+next to the code they measure: `internal/api/reclaim_bench_test.go`.
+
+The NFR-1 latency and NFR-4 scale benches land at M4 and M5.
+
+## CI speedup vs hosted runners
+
+`ci-speedup.sh` dispatches `forge-bench.yml` N times. Each run executes an
+identical job on `ubuntu-latest` and on a Forge worker
+(`runs-on: [self-hosted, forge]`), sequentially across trials so a
+single-worker fleet never queues one benchmark job behind another.
+
+### What is measured
+
+All timing comes from GitHub's Jobs API, never from Forge's own
+bookkeeping:
+
+- **execution** = `completed_at - started_at`. Runner picked up the job to
+  job finished. This is the number for a speedup claim.
+- **queued** = `started_at - created_at`. Reported separately, not folded
+  into the speedup, because a single-worker fleet and GitHub's own
+  scheduling both sit in it.
+- **total** = `completed_at - created_at`. End-to-end, reported alongside.
+
+The script prints the median of N trials for each variant and the
+hosted/forge ratio for execution and total.
+
+### Workload
+
+Pinned Go 1.23.4 toolchain, then:
+
+1. `go build -a std cmd`: compile the standard library and the entire
+   Go toolchain (compiler, linker, go command) from scratch. This is
+   the bulk of the workload, minutes of pure compute.
+2. `go test -count=1 -short` over sixteen stdlib trees (`archive`,
+   `bufio`, `bytes`, `compress`, `container`, `encoding`, `fmt`,
+   `hash`, `image`, `index`, `math`, `regexp`, `sort`, `strconv`,
+   `strings`, `text`, `unicode`). `crypto/...` is omitted: Go 1.23.4's
+   `crypto/tls` testdata certificates expired on 2025-01-01, so those
+   tests fail on today's clock on every runner.
+
+The workload must dwarf fixed per-job overhead (sandbox creation and
+the in-container toolchain download on Forge, both ~20s) or the ratio
+measures overhead, not compute.
+
+Chosen because it is CPU-bound, has zero third-party module downloads (the
+toolchain ships the source), and is byte-identical on both runners. The
+speedup measures compute, not a network lottery.
+
+### Sandbox image
+
+`setup-go` downloads the toolchain into a fresh container on every Forge
+job; a hosted runner has it preinstalled. That download is fixed
+per-job overhead, not compute, and it is large enough relative to a
+short job to distort the ratio. `Dockerfile` builds a sandbox image
+that pre-populates `setup-go`'s own tool cache with Go 1.23.4, so the
+same, unmodified `setup-go` step in `forge-bench.yml` finds a cache hit
+on Forge instead of downloading. This does not touch the workflow: it
+only removes overhead that a real installed toolchain would not pay.
+
+Build it once, on the machine running `forge-agent`:
+
+```bash
+docker build -t forge-bench:go1.23.4 -f Dockerfile .
+```
+
+Start (or restart) the control plane with `-image forge-bench:go1.23.4`
+instead of the bare `ghcr.io/actions/actions-runner:latest`.
+
+### Run it
+
+1. Copy `forge-bench.yml` to `.github/workflows/forge-bench.yml` in a
+   repo connected to Forge and commit it to the default branch. Do not
+   put it in this repo's `.github/workflows/`: Forge's own CI stays on
+   `ubuntu-latest`.
+2. Have the M3 stack running: control plane (using the image above), at
+   least one enrolled worker, webhook delivering to Forge. The control
+   plane queues only `self-hosted` jobs, so the hosted matrix leg does
+   not occupy a worker.
+3. From this directory, with `gh` authenticated against that repo:
+
+```bash
+BENCH_REPO=owner/repo TRIALS=5 ./ci-speedup.sh
+```
+
+Raw per-job JSON is written to `results/<timestamp>.json` (gitignored).
+A failed trial aborts the benchmark; partial results are not reported.
+
+### Honest reporting
+
+A number from this script is quotable only with all of the following:
+
+- **The worker hardware.** The speedup is mostly your machine vs GitHub's
+  2-core hosted runner. Say what the machine is (the `Record host` step
+  logs `uname -a` and the CPU count in every job).
+- **The workload.** "Go stdlib build and test suite", not "CI".
+- **Median of N trials**, with N stated. Never a best-of.
+- **Cold sandboxes.** At M3 there is no warm pool; every Forge job pays
+  container creation inside the measured window, which a hosted runner's
+  always-on VM does not. This asymmetry favors the hosted runner, which
+  makes the measured speedup conservative. Re-run after M4 warm pools
+  before citing a warm-start number.
+- **Sandbox limits.** The Forge job runs under the configured sandbox CPU
+  and memory limits. State them if they are below the host's capacity.
+
+Do not cite queued or total medians as a speedup without noting fleet size:
+with one worker, Forge queue wait is a property of the test setup, not the
+scheduler.
+
+## Reclaim (FR-11)
+
+Package tests in `internal/api/reclaim_bench_test.go`. Not a hosted-vs-Forge
+comparison; they measure the control plane's reclaim path.
+
+```bash
+go test ./internal/api/ -run '^$' -bench BenchmarkReclaimSweep -benchtime 300x
+go test ./internal/api/ -run TestReclaimIsIdempotentUnderConcurrentClaims -race -v
+```

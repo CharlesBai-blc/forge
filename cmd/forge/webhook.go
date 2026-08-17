@@ -34,7 +34,7 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	accepted := false
 	for _, ev := range events {
-		if ev.Kind != "queued" {
+		if ev.Kind != "queued" || !selfHosted(ev.Labels) {
 			continue
 		}
 		j, err := jobFromEvent(ev)
@@ -57,6 +57,15 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func selfHosted(labels []string) bool {
+	for _, l := range labels {
+		if l == "self-hosted" {
+			return true
+		}
+	}
+	return false
 }
 
 func jobFromEvent(ev source.JobEvent) (*job.Job, error) {
