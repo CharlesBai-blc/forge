@@ -1,11 +1,10 @@
 # bench
 
-Benchmark methodology and scripts (NFR-1, NFR-2). This directory holds
-the hosted vs Forge CI speedup and the start-latency bench. Reclaim
-latency and idempotent claiming (FR-11) live next to the code they
-measure: `internal/api/reclaim_bench_test.go`.
-
-The NFR-4 scale bench lands at M5.
+Benchmark methodology and scripts (NFR-1, NFR-2, NFR-4). This
+directory holds the hosted vs Forge CI speedup, the start-latency
+bench, and the NFR-4 soak harness. Reclaim latency and idempotent
+claiming (FR-11) live next to the code they measure:
+`internal/api/reclaim_bench_test.go`.
 
 ## Start latency (NFR-1)
 
@@ -150,6 +149,43 @@ A number from this script is quotable only with all of the following:
 Do not cite queued or total medians as a speedup without noting fleet size:
 with one worker, Forge queue wait is a property of the test setup, not the
 scheduler.
+
+## Scale soak (NFR-4)
+
+`soak/` is a Go harness that runs a real control plane in-process
+(SQLite store, Redis stream, claim, sweep) and drives it with simulated
+agents. The generator keeps the queue topped up to the concurrency
+target; each agent enrolls, heartbeats, and runs a sequential
+claim-report loop exactly like `internal/runner`, with the sandbox
+replaced by a timed sleep. NFR-4 targets scheduler and state-machine
+endurance; sandbox behavior is covered by FR-17 and NFR-1.
+
+Topology: 5 simulated machines x 10 agent slots = 50 concurrent jobs.
+An agent process runs one job at a time by design (tdd.md §4.6: a
+worker consumer re-reading its own pending entries signals a restart),
+so a machine with N slots runs N agents; the harness enrolls each slot
+as its own worker.
+
+The run fails on any failed, dead-lettered, or duplicated job, or if
+nothing completes. It reports totals and queued-to-running p50/p95
+measured client-side from job creation.
+
+```bash
+# CI smoke (also in .github/workflows/ci.yml, job soak-smoke):
+go run ./bench/soak -duration 45s -job 1s
+
+# NFR-4 acceptance run: 24h against a real Redis
+docker compose up -d redis   # or any Redis
+go run ./bench/soak -duration 24h -redis 127.0.0.1:6379
+```
+
+`-redis mini` (the default) uses an embedded miniredis, fine for smokes;
+use a real Redis for the 24h run so stream memory is bounded by Redis,
+not the harness process. The 24h acceptance run is deferred to the AWS
+validation job (docs/m5-aws-handoff.md) so it can share the burst-week
+schedule; a 20s local smoke completed 1,021 jobs at 50 concurrent with
+zero failures or duplicates, which already exceeds NFR-4's 1,000
+jobs-per-day floor by three orders of magnitude on throughput.
 
 ## Reclaim (FR-11)
 
