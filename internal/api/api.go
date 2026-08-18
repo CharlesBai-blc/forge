@@ -49,6 +49,17 @@ type Dashboard struct {
 	QueueDepth int               `json:"queue_depth"`
 	Jobs       []DashboardJob    `json:"jobs"`
 	Workers    []DashboardWorker `json:"workers"`
+	Burst      *BurstStatus      `json:"burst,omitempty"`
+}
+
+// BurstStatus is the dashboard's burst activity panel (FR-23, FR-24):
+// desired instance count, caps, and any cap or apply-failure banner.
+type BurstStatus struct {
+	Instances      int     `json:"instances"`
+	MaxInstances   int     `json:"max_instances"`
+	HoursToday     float64 `json:"hours_today"`
+	MaxHoursPerDay float64 `json:"max_hours_per_day"`
+	Banner         string  `json:"banner,omitempty"`
 }
 
 // DashboardJob is one row of the job list.
@@ -76,6 +87,7 @@ type DashboardWorker struct {
 	LastSeen    time.Time       `json:"last_seen"`
 	Arch        string          `json:"arch"`
 	Utilization float64         `json:"utilization"`
+	Burst       bool            `json:"burst"`
 }
 
 // JobDetail is GET /v1/jobs/{id} (FR-9, FR-26).

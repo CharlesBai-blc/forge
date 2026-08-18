@@ -8,20 +8,61 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/CharlesBai-blc/forge/internal/job"
+	"github.com/CharlesBai-blc/forge/internal/secret"
 	"github.com/CharlesBai-blc/forge/internal/source"
 	"github.com/CharlesBai-blc/forge/internal/store"
 	"github.com/CharlesBai-blc/forge/internal/stream"
 	"github.com/alicebob/miniredis/v2"
 	_ "modernc.org/sqlite"
 )
+
+const (
+	testAdminUser     = "admin"
+	testAdminPassword = "testpassword"
+)
+
+// seedAdmin creates the admin account so session-gated dashboard
+// routes can be exercised (tdd.md §7).
+func seedAdmin(t *testing.T, st *store.Store) {
+	t.Helper()
+	hash, err := secret.HashPassword(testAdminPassword)
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	if err := st.CreateAdmin(context.Background(), testAdminUser, hash); err != nil {
+		t.Fatalf("CreateAdmin: %v", err)
+	}
+}
+
+// adminHTTP returns an http.Client holding a logged-in admin session.
+func adminHTTP(t *testing.T, baseURL string) *http.Client {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hc := &http.Client{Jar: jar}
+	body := fmt.Sprintf(`{"username":%q,"password":%q}`, testAdminUser, testAdminPassword)
+	resp, err := hc.Post(baseURL+"/v1/admin/login", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("login status = %d", resp.StatusCode)
+	}
+	return hc
+}
 
 func enrollWorker(t *testing.T, st *store.Store) (id, token string) {
 	t.Helper()
@@ -133,6 +174,7 @@ func openAPI(t *testing.T, src *fakeSource) (*store.Store, *stream.Stream, strin
 	h.Register(mux)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
+	seedAdmin(t, st)
 	id, tok := enrollWorker(t, st)
 	c := &Client{BaseURL: srv.URL, Token: tok, WorkerID: id, HTTP: srv.Client()}
 	return st, jobs, logDir, c, src, h
