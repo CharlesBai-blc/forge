@@ -144,6 +144,55 @@ func TestLogs(t *testing.T) {
 	}
 }
 
+// TestWarmStartThenAttach exercises the FR-16 warm path: the container
+// starts idle on a wait loop, and a later Start only injects the JIT
+// credential to release it.
+func TestWarmStartThenAttach(t *testing.T) {
+	p := dockerProvider(t)
+	sb := createSandbox(t, p, testSpec("sh", "-c",
+		"while [ ! -f /jitconfig ]; do sleep 0.1; done; cat /jitconfig"))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	w, ok := sb.(sandbox.Warmable)
+	if !ok {
+		t.Fatal("docker sandbox does not implement Warmable")
+	}
+	if err := w.WarmStart(ctx); err != nil {
+		t.Fatalf("WarmStart: %v", err)
+	}
+	if err := w.WarmStart(ctx); err == nil {
+		t.Fatal("expected error on second WarmStart")
+	}
+
+	const blob = "warm-jit-blob"
+	if err := sb.Start(ctx, blob); err != nil {
+		t.Fatalf("Start after WarmStart: %v", err)
+	}
+	if err := sb.Start(ctx, blob); err == nil {
+		t.Fatal("expected error on second Start (FR-13)")
+	}
+	code, err := sb.Wait(ctx)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	rc, err := sb.Logs(ctx, false)
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read logs: %v", err)
+	}
+	if !bytes.Contains(b, []byte(blob)) {
+		t.Errorf("logs = %q, want %q", b, blob)
+	}
+}
+
 func TestStartInjectsJIT(t *testing.T) {
 	p := dockerProvider(t)
 	sb := createSandbox(t, p, testSpec("su", "-s", "/bin/sh", "nobody", "-c", "cat /"+jitPath))

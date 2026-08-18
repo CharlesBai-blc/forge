@@ -7,10 +7,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
+	"strconv"
 	"sync"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -25,9 +28,26 @@ var (
 
 const jitPath = "jitconfig"
 
+// Hardened profile constants (FR-15, tdd.md §4.5). The capability and
+// seccomp baseline is documented in docs/design/threat-model.md and
+// asserted by the FR-17 isolation suite.
+const (
+	// hardenedNetwork is a dedicated bridge with inter-container
+	// communication disabled: jobs get egress (GitHub) but cannot
+	// reach sibling sandboxes.
+	hardenedNetwork = "forge-jobs"
+	// hardenedUser is the actions/runner uid. Numeric so it holds on
+	// images without a matching passwd entry.
+	hardenedUser = "1001"
+)
+
 // Provider drives container lifecycle via the Docker Engine API.
 type Provider struct {
 	cli *client.Client
+	Log *slog.Logger
+
+	netMu    sync.Mutex
+	netReady bool
 }
 
 // NewProvider connects to the local Docker daemon.
@@ -45,6 +65,13 @@ func (p *Provider) Ping(ctx context.Context) error {
 	return err
 }
 
+func (p *Provider) log() *slog.Logger {
+	if p.Log != nil {
+		return p.Log
+	}
+	return slog.Default()
+}
+
 // Close closes the Docker client.
 func (p *Provider) Close() error {
 	return p.cli.Close()
@@ -52,6 +79,10 @@ func (p *Provider) Close() error {
 
 // Create pulls spec.Image if needed and creates a fresh, not-yet-started
 // container with spec's resource limits. It does not start the container.
+// With spec.Hardened, the FR-15 profile applies: dedicated ICC-off bridge,
+// no-new-privileges, all capabilities dropped, Docker's default seccomp
+// profile, non-root user, and the disk quota when the storage driver
+// supports it.
 func (p *Provider) Create(ctx context.Context, spec sandbox.Spec) (sandbox.Sandbox, error) {
 	if spec.Image == "" {
 		return nil, fmt.Errorf("docker: image required")
@@ -60,6 +91,10 @@ func (p *Provider) Create(ctx context.Context, spec sandbox.Spec) (sandbox.Sandb
 		return nil, err
 	}
 
+	cfg := &container.Config{
+		Image: spec.Image,
+		Cmd:   spec.Command,
+	}
 	host := &container.HostConfig{}
 	if spec.CPU > 0 {
 		host.NanoCPUs = int64(spec.CPU * 1e9)
@@ -71,15 +106,68 @@ func (p *Provider) Create(ctx context.Context, spec sandbox.Spec) (sandbox.Sandb
 		pids := spec.PIDs
 		host.PidsLimit = &pids
 	}
+	if spec.Hardened {
+		if err := p.ensureNetwork(ctx); err != nil {
+			return nil, err
+		}
+		host.NetworkMode = hardenedNetwork
+		// no-new-privileges blocks setuid escalation; seccomp is left
+		// unset so Docker's default profile applies (tdd.md §4.5).
+		host.SecurityOpt = []string{"no-new-privileges"}
+		// Baseline: none. The runner is non-root, and no capability is
+		// required to run CI steps as uid 1001 (threat-model.md).
+		host.CapDrop = []string{"ALL"}
+		cfg.User = hardenedUser
+		if spec.DiskBytes > 0 {
+			host.StorageOpt = map[string]string{"size": strconv.FormatInt(spec.DiskBytes, 10)}
+		}
+	}
 
-	resp, err := p.cli.ContainerCreate(ctx, &container.Config{
-		Image: spec.Image,
-		Cmd:   spec.Command,
-	}, host, nil, nil, "")
+	resp, err := p.cli.ContainerCreate(ctx, cfg, host, nil, nil, "")
+	if err != nil && host.StorageOpt != nil {
+		// FR-14: disk quotas are storage-driver dependent (overlay2 on
+		// xfs with pquota). Rather than guess from the daemon's error
+		// text, just retry once without the quota: enforcing the rest
+		// of the hardened profile beats refusing to run the job. If
+		// the retry fails too, its error is the one that's returned.
+		p.log().Warn("docker: create with disk limit failed, retrying without it", "err", err)
+		host.StorageOpt = nil
+		resp, err = p.cli.ContainerCreate(ctx, cfg, host, nil, nil, "")
+	}
 	if err != nil {
 		return nil, fmt.Errorf("docker: create: %w", err)
 	}
 	return &dockerSandbox{cli: p.cli, containerID: resp.ID}, nil
+}
+
+// ensureNetwork creates the hardened bridge if it does not exist.
+// Inter-container communication is disabled on it, so sandboxes cannot
+// see each other while keeping outbound access to GitHub (FR-15).
+func (p *Provider) ensureNetwork(ctx context.Context) error {
+	p.netMu.Lock()
+	defer p.netMu.Unlock()
+	if p.netReady {
+		return nil
+	}
+	_, err := p.cli.NetworkInspect(ctx, hardenedNetwork, network.InspectOptions{})
+	if err == nil {
+		p.netReady = true
+		return nil
+	}
+	if !errdefs.IsNotFound(err) {
+		return fmt.Errorf("docker: network inspect: %w", err)
+	}
+	_, err = p.cli.NetworkCreate(ctx, hardenedNetwork, network.CreateOptions{
+		Driver: "bridge",
+		Options: map[string]string{
+			"com.docker.network.bridge.enable_icc": "false",
+		},
+	})
+	if err != nil && !errdefs.IsConflict(err) { // conflict: another agent process created it first
+		return fmt.Errorf("docker: network create: %w", err)
+	}
+	p.netReady = true
+	return nil
 }
 
 func (p *Provider) ensureImage(ctx context.Context, ref string) error {
@@ -104,12 +192,33 @@ type dockerSandbox struct {
 
 	mu      sync.Mutex
 	started bool
+	warm    bool
 }
+
+var _ sandbox.Warmable = (*dockerSandbox)(nil)
 
 func (s *dockerSandbox) ID() string { return s.containerID }
 
-// Start starts the container. If jitEncoded is non-empty, it is copied
-// in as /jitconfig first (FR-4). Errors if called twice.
+// WarmStart starts the container before a job attaches (FR-16). The
+// command idles until /jitconfig appears, so a later Start only injects
+// the credential. Errors if the sandbox already started.
+func (s *dockerSandbox) WarmStart(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started || s.warm {
+		return fmt.Errorf("docker: sandbox %s already started", s.containerID)
+	}
+	if err := s.cli.ContainerStart(ctx, s.containerID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("docker: warm start: %w", err)
+	}
+	s.warm = true
+	return nil
+}
+
+// Start begins the job. If jitEncoded is non-empty, it is copied in as
+// /jitconfig (FR-4). A warm sandbox is already running its wait loop, so
+// the copy alone releases it; a cold one is started after the copy.
+// Errors if called twice (FR-13).
 func (s *dockerSandbox) Start(ctx context.Context, jitEncoded string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -121,8 +230,10 @@ func (s *dockerSandbox) Start(ctx context.Context, jitEncoded string) error {
 			return err
 		}
 	}
-	if err := s.cli.ContainerStart(ctx, s.containerID, container.StartOptions{}); err != nil {
-		return fmt.Errorf("docker: start: %w", err)
+	if !s.warm {
+		if err := s.cli.ContainerStart(ctx, s.containerID, container.StartOptions{}); err != nil {
+			return fmt.Errorf("docker: start: %w", err)
+		}
 	}
 	s.started = true
 	return nil
