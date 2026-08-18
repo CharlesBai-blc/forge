@@ -30,3 +30,14 @@ jobs:
         with:
           go-version: '1.23'
       - run: go test ./internal/api/ -run TestChaos -race -v
+  soak-smoke:
+    # NFR-4 harness, short smoke: 50 concurrent simulated agents against
+    # a real control plane; fails on any lost, failed, or duplicated
+    # job. The 24h acceptance run uses the same binary (bench/README.md).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - run: go run ./bench/soak -duration 45s -job 1s
