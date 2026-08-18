@@ -51,13 +51,24 @@ type Handler struct {
 	MaxAttempts int
 	SweepEvery  time.Duration
 	LogPoll     time.Duration
+	SessionTTL  time.Duration // admin session lifetime; default 24h (tdd.md §7)
+	// SaveCreds persists GitHub credentials captured by the web setup
+	// flow (FR-2). Nil means setup only creates the admin account.
+	SaveCreds func(ctx context.Context, webhookSecret, githubToken string) error
+	// BurstStatus feeds the dashboard's burst panel (FR-23, FR-24).
+	// Nil when burst is not configured.
+	BurstStatus func(ctx context.Context) BurstStatus
 
-	mu   sync.Mutex
-	msgs map[string]string          // jobID -> stream message ID, until XACK
-	hbs  map[string]map[string]bool // workerID -> job IDs reported running in the latest heartbeat
+	setupMu sync.Mutex // serializes the one-shot setup check and commit
+	mu      sync.Mutex
+	msgs    map[string]string          // jobID -> stream message ID, until XACK
+	hbs     map[string]map[string]bool // workerID -> job IDs reported running in the latest heartbeat
 }
 
-// Register attaches agent and dashboard routes to mux.
+// Register attaches agent and dashboard routes to mux. Dashboard-serving
+// and admin routes require an admin session (tdd.md §7); agent routes
+// keep per-machine token auth, and /metrics and the webhook stay open
+// (threat-model.md §5).
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/agents/enroll", h.enroll)
 	mux.HandleFunc("POST /v1/agents/{id}/heartbeat", h.heartbeat)
@@ -66,9 +77,14 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/jobs/{id}/attempts/{n}/status", h.status)
 	mux.HandleFunc("POST /v1/jobs/{id}/attempts/{n}/logs", h.logs)
 	mux.HandleFunc("GET /{$}", h.page)
-	mux.HandleFunc("GET /v1/dashboard", h.dashboard)
-	mux.HandleFunc("GET /v1/jobs/{id}", h.jobDetail)
-	mux.HandleFunc("GET /v1/jobs/{id}/logs/stream", h.logStream)
+	mux.HandleFunc("POST /v1/admin/login", h.adminLogin)
+	mux.HandleFunc("POST /v1/admin/logout", h.adminLogout)
+	mux.HandleFunc("GET /setup", h.setupPage)
+	mux.HandleFunc("POST /setup", h.setupSubmit)
+	mux.HandleFunc("POST /v1/admin/workers/{id}/{action}", h.requireSession(h.adminWorkerAction))
+	mux.HandleFunc("GET /v1/dashboard", h.requireSession(h.dashboard))
+	mux.HandleFunc("GET /v1/jobs/{id}", h.requireSession(h.jobDetail))
+	mux.HandleFunc("GET /v1/jobs/{id}/logs/stream", h.requireSession(h.logStream))
 	mux.Handle("GET /metrics", h.metricsHandler())
 }
 

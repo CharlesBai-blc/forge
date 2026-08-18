@@ -99,6 +99,19 @@ func TestValidateRequiredFlags(t *testing.T) {
 	if err := ok.validate(); err != nil {
 		t.Fatalf("validate without command: %v", err)
 	}
+
+	ok.burstDir = "deploy/terraform/burst"
+	if err := ok.validate(); err == nil {
+		t.Fatal("validate burst without URL and agent URL: expected error")
+	}
+	ok.burstURL = "https://forge.example"
+	if err := ok.validate(); err == nil {
+		t.Fatal("validate burst without agent URL: expected error")
+	}
+	ok.burstAgentURL = "https://example/forge-agent-linux-arm64"
+	if err := ok.validate(); err != nil {
+		t.Fatalf("validate burst: %v", err)
+	}
 }
 
 func TestJobCommandDefaultsToRunnerJIT(t *testing.T) {
