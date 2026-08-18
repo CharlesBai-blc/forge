@@ -277,7 +277,7 @@ Single-use is structural: nothing in the interface can hand a used sandbox to a 
 
 **Hardened profile (FR-15) [M4].** `Hardened: true` maps to: no host network (default bridge with inter-container communication disabled), `--security-opt no-new-privileges`, all capabilities dropped except the documented baseline, Docker's default seccomp profile, non-root user, read-only host mounts limited to the image's own content, and the FR-14 resource limits. The exact capability and seccomp baseline is documented in the threat model (FR-28) and asserted by the isolation suite (FR-17).
 
-**Warm pool (FR-16) [M4].** The agent keeps up to `warm_pool_size` (default 2) sandboxes per configured label set: created and started, runner installed but idle, waiting for a credential. On claim, the agent takes a warm sandbox if one exists, otherwise falls through to a cold `Create`. `Start` injects the JIT config into the already-running container via the Docker exec API. The pool refills asynchronously after each take. Warm sandboxes are ordinary `Sandbox` values: taken once, destroyed after their one job, so FR-13's invariant is unchanged. NFR-1's under-2s warm start is the pool's acceptance test.
+**Warm pool (FR-16) [M4].** The agent keeps up to `warm_pool_size` (default 2) sandboxes per configured label set: created and started, runner installed but idle, waiting for a credential. The agent learns the sandbox spec before any claim via `GET /v1/agents/{id}/spec`. On claim, the agent takes a warm sandbox if one exists and the claim's spec matches, otherwise falls through to a cold `Create`. Attachment: the default command idles until `/jitconfig` exists, and `Start` on a warm sandbox injects the JIT file into the already-running container, which releases it. (Revised at M4 from the exec-API design: file injection shares one code path with the cold start, where the file is copied before the container starts and the wait loop exits immediately, and it keeps the container's exit code equal to the job's exit code.) The pool refills asynchronously after each take. Warm sandboxes are ordinary `Sandbox` values: taken once, destroyed after their one job, so FR-13's invariant is unchanged. NFR-1's under-2s warm start is the pool's acceptance test.
 
 ### 4.6 Wire contract: agent API [M1 in-process, M3 over HTTPS]
 
@@ -315,7 +315,7 @@ type StatusReport struct {
 
 `claim` blocks server-side on `XREADGROUP BLOCK` with consumer name set to the worker ID, up to 30s, then returns 204 and the agent re-polls. A claim is delivered only after the control plane verifies the worker is `active` and the job is still `queued` in SQLite (this is where cancelled-while-queued jobs are dropped: acknowledged in the stream, skipped, marked failed with reason `cancelled`).
 
-The same listener serves the dashboard (embedded static assets via `embed.FS`, FR-24), `GET /v1/jobs/{id}/logs/stream` for SSE log tailing (§4.8), `POST /webhook/github`, and `/metrics` in Prometheus format (FR-25). TLS is on by default with a self-signed certificate generated at setup; the bootstrap command embeds the certificate fingerprint and agents pin it (§7).
+The same listener serves the dashboard (embedded static assets via `embed.FS`, FR-24), `GET /v1/jobs/{id}/logs/stream` for SSE log tailing (§4.8), `POST /webhook/github`, and `/metrics` in Prometheus format (FR-25). The agent serves its own `/metrics` (sandbox start time, warm-pool hit rate) on a local listener, `-metrics-addr`, default `127.0.0.1:9091`. Metrics use `prometheus/client_golang`, justified under `fs.md` §1.1.1: FR-25 requires the Prometheus exposition format, and hand-rolling histogram exposition is more code than the dependency. TLS is on by default with a self-signed certificate generated at setup; the bootstrap command embeds the certificate fingerprint and agents pin it (§7).
 
 ### 4.7 Critical path: job submission through result [M2, queue semantics M3]
 
@@ -538,7 +538,7 @@ All settable via config file, flag, or env (FR-2). The chaos suite runs against 
 | sandbox CPU limit | 2.0 | FR-14 |
 | sandbox memory limit | 4 GiB | FR-14 |
 | sandbox PID limit | 4096 | FR-14 |
-| sandbox disk limit | none until M4 | storage-driver dependent, ships with FR-15 |
+| sandbox disk limit | 20 GiB from M4 | storage-driver dependent, ships with FR-15 |
 | warm pool size per label set | 2 | FR-16 |
 | log retention | 30 days / 5 GiB | oldest first |
 | burst up window | 120s | FR-21 |
