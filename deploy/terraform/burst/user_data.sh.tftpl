@@ -1,0 +1,30 @@
+#!/bin/bash
+# Burst worker bootstrap (FR-3, FR-21): install Docker and forge-agent,
+# enroll against the control plane with the one-time burst token.
+set -euo pipefail
+
+apt-get update
+apt-get install -y docker.io curl
+systemctl enable --now docker
+
+curl -fsSL -o /usr/local/bin/forge-agent '${agent_download_url}'
+chmod +x /usr/local/bin/forge-agent
+mkdir -p /var/lib/forge-agent
+
+cat > /etc/systemd/system/forge-agent.service <<'UNIT'
+[Unit]
+Description=forge-agent burst worker
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+ExecStart=/usr/local/bin/forge-agent -addr '${control_plane_url}' -enroll-token '${enroll_token}' -data-dir /var/lib/forge-agent
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now forge-agent
