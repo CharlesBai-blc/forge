@@ -348,9 +348,10 @@ All defaults are in Appendix B and are exercised by the chaos suite (NFR-3), whi
 
 A control-plane loop compares queue depth to idle fleet capacity (FR-21):
 
-- Scale up: depth exceeds capacity continuously for `burst_up_window` (default 120s). The controller runs the bundled Terraform module (`terraform apply` with `-var count=n`) to add instances, up to `burst_max_instances` (default 2). Instances cloud-init the FR-3 bootstrap one-liner with a pre-issued enrollment token, so a burst worker is an ordinary worker with `Burst: true`.
+- Scale up: depth exceeds capacity continuously for `burst_up_window` (default 120s). The controller runs the bundled Terraform module (`terraform apply` with `-var instance_count=n`; Terraform reserves the name `count`) to add instances, up to `burst_max_instances` (default 2). Instances cloud-init the FR-3 bootstrap one-liner with a pre-issued enrollment token, so a burst worker is an ordinary worker with `Burst: true`. Tokens are single-use, so the module ignores `user_data` changes on existing instances: a new token only reaches instances the current apply creates.
 - Scale down: depth below `burst_down_threshold` for `burst_down_window` (default 600s). The controller drains the newest burst worker (FR-19 semantics: running jobs finish, FR-22), then destroys its instance.
 - Caps: `burst_max_instances` and `burst_max_hours_per_day` (default 12) are enforced before every apply; a hit cap is a dashboard banner and a metric (FR-23).
+- State that must survive a restart lives in the `burst_events` ledger (Appendix A): the latest row is the desired instance count, and daily instance-hours for FR-23 are integrated from it. Sustained-window tracking is in memory; a restart at worst re-waits one window.
 
 The `terraform` binary is an external dependency of burst only: justified under `fs.md` §1.1.1 because the Terraform module is itself a charter deliverable, and the feature is off unless configured. Instance sizing, AMI strategy, and spot policy are §9 OQ4.
 
@@ -438,7 +439,7 @@ Each row is the test that proves a design decision holds. Suites: `unit` (per pa
 | Redis outage (§6.3) | NFR-3 | stop Redis under load; backlog drains after restart, no job lost | chaos |
 | Warm start latency (§4.5) | NFR-1, FR-16, FR-25 | p95 queued-to-executing under 2s warm, under 5s cold, measured from FR-25 metrics on the reference host | bench/ |
 | 2x speedup claim | NFR-2 | reference workload vs `ubuntu-latest`, scripted methodology | bench/ |
-| Single-node fleet scale (§2) | NFR-4 | 24h soak: 5 simulated workers, 50 concurrent jobs sustained, 1,000+ jobs completed; queue depth and NFR-1 latency stay in bounds, zero dropped or duplicated jobs | bench/ |
+| Single-node fleet scale (§2) | NFR-4 | 24h soak: 5 simulated machines x 10 agent slots (an agent runs one job at a time per §4.6, so a multi-slot machine runs one agent per slot), 50 concurrent jobs sustained, 1,000+ jobs completed; queue depth and NFR-1 latency stay in bounds, zero dropped or duplicated jobs | bench/ |
 | Enrollment and revocation (§7) | FR-3, FR-27 | enrollment token single-use and expiring; revoked worker token rejected on next request | integration |
 | JIT single-use (§4.4) | FR-5 | one registration per attempt; reclaimed unconsumed registrations unregistered | integration |
 | Burst lifecycle (§4.10) | FR-21, FR-22, FR-23 | flood queue against localstack-or-real AWS: instances appear within window, drain before terminate, caps never exceeded | integration (M5) |
@@ -494,13 +495,21 @@ CREATE TABLE workers (
     last_seen  TEXT NOT NULL,
     token_hash BLOB NOT NULL,
     arch       TEXT NOT NULL,
-    version    TEXT NOT NULL
+    version    TEXT NOT NULL,
+    created_at TEXT                          -- enrollment time; NULL pre-M5
 );
 
 CREATE TABLE enrollment_tokens (
     token_hash BLOB PRIMARY KEY,
     expires_at TEXT NOT NULL,
-    used_at    TEXT
+    used_at    TEXT,
+    burst      INTEGER NOT NULL DEFAULT 0    -- pre-issued by the burst controller (FR-21)
+);
+
+CREATE TABLE burst_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    count      INTEGER NOT NULL,             -- desired instance count after the event
+    created_at TEXT NOT NULL                 -- FR-23 instance-hours integrate from here
 );
 
 CREATE TABLE admin (

@@ -1,6 +1,6 @@
 # Forge threat model
 
-**Version:** 1.0 | **Date:** August 17, 2026 | **Owner:** Charles Bai
+**Version:** 1.1 | **Date:** August 18, 2026 | **Owner:** Charles Bai
 **Requirement:** FR-28. Claims map to the FR-17 isolation suite
 (`internal/sandbox/docker/isolation_test.go`) and to tests named below.
 This document also fixes the capability and seccomp baseline that
@@ -139,12 +139,31 @@ scope for the hardened profile by design. Asserted by
 ## 5. Secrets and control-plane surface
 
 Covered in tdd.md §7 and tested where noted there: GitHub credentials
-and enrollment tokens encrypted at rest (FR-27), per-machine revocable
-agent tokens, webhook HMAC verification, admin session auth at M5.
-Until then, the dashboard (`/v1/dashboard`, `/v1/jobs/*`) and the FR-25
-`/metrics` endpoint are unauthenticated: anyone reaching the control
-plane can read job metadata, logs, and queue/latency metrics. No
-secrets are exposed by either surface. Deploy behind a network
-boundary (VPN, firewall) until M5 admin auth lands.
+encrypted at rest (FR-27), enrollment tokens and per-machine agent
+tokens stored as SHA-256 hashes and revocable from the CLI and the
+dashboard, webhook HMAC verification.
 
-*Revision log:* v1.0 initial, published at M4 per FR-28.
+Since M5, dashboard-serving routes (`/`, `/v1/dashboard`,
+`/v1/jobs/*` reads) and `/v1/admin/*` require an admin session:
+Argon2id-hashed password, 32-byte random session token in an
+`HttpOnly; SameSite=Strict` cookie (`Secure` when serving TLS), only
+the token's SHA-256 hash stored, 24h expiry. Tested by
+`TestSessionGatesDashboardRoutes`, `TestLoginRejectsBadCredentials`,
+`TestSessionExpires`, `TestLogoutInvalidatesSession`,
+`TestSessionCookieHardened` (`internal/api/admin_test.go`). The
+first-run `/setup` flow is one-shot: it works only while no admin
+exists (`TestSetupFlowOneShot`), so an operator who completes setup
+closes the window.
+
+Still open by design: `/webhook/github` (authenticated by HMAC, not
+sessions) and the FR-25 `/metrics` endpoint, which exposes queue and
+latency metrics but no secrets or job content. Burst enrollment tokens
+(FR-21) are one-time, expire in 1h, and only their hashes are stored;
+the plaintext passes to AWS via Terraform variables and instance
+user-data, which anyone with EC2 `DescribeInstanceAttribute` on the
+account can read: an account-level attacker is already a malicious
+operator (§4).
+
+*Revision log:* v1.0 initial, published at M4 per FR-28. v1.1 at M5:
+admin session auth landed; dashboard no longer unauthenticated; burst
+token surface added.

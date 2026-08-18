@@ -8,4 +8,9 @@
 # Local NFR-2 run output (machine-specific; regenerate with ci-speedup.sh)
 /bench/results/
 
+# Terraform working state (the lock file is committed)
+.terraform/
+*.tfstate
+*.tfstate.backup
+
 .DS_Store
