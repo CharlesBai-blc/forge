@@ -1,0 +1,10 @@
+# NFR-1 start-latency probe. The job body is a single echo so the
+# measured window is start overhead, not workload. Copy to
+# .github/workflows/forge-latency.yml in a repo connected to Forge.
+name: forge-latency
+on: workflow_dispatch
+jobs:
+  latency-forge:
+    runs-on: [self-hosted, forge]
+    steps:
+      - run: echo latency-probe

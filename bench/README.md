@@ -1,10 +1,51 @@
 # bench
 
-Benchmark methodology and scripts (NFR-2). This directory holds the hosted
-vs Forge CI speedup. Reclaim latency and idempotent claiming (FR-11) live
-next to the code they measure: `internal/api/reclaim_bench_test.go`.
+Benchmark methodology and scripts (NFR-1, NFR-2). This directory holds
+the hosted vs Forge CI speedup and the start-latency bench. Reclaim
+latency and idempotent claiming (FR-11) live next to the code they
+measure: `internal/api/reclaim_bench_test.go`.
 
-The NFR-1 latency and NFR-4 scale benches land at M4 and M5.
+The NFR-4 scale bench lands at M5.
+
+## Start latency (NFR-1)
+
+`start-latency.sh` reports p95 job-start latency from the FR-25 metrics
+(the benchmark consumes the metrics; it does not time anything itself):
+
+- **queued-to-running p95** from the control plane's
+  `forge_job_latency_seconds{phase="queued_to_running"}` histogram.
+  NFR-1 target: under 2s with the warm pool on.
+- **sandbox start p95 per mode** from the agent's
+  `forge_agent_sandbox_start_seconds{mode="warm"|"cold"}` histogram,
+  plus warm-pool hit and miss counts. NFR-1 target: cold under 5s.
+
+p95 is interpolated from histogram buckets, the same estimate
+Prometheus's `histogram_quantile()` gives.
+
+### Run it
+
+1. Copy `forge-latency.yml` to `.github/workflows/forge-latency.yml` in
+   a repo connected to Forge. The job body is one `echo`, so the
+   measured window is start overhead, not workload.
+2. Histograms accumulate for the process lifetime, so restart the
+   control plane and agent before each scenario to start from clean
+   counters:
+   - **warm scenario:** agent with the default `-warm-pool 2`.
+   - **cold scenario:** agent with `-warm-pool 0`.
+3. From this directory, with `gh` authenticated against that repo:
+
+```bash
+BENCH_REPO=owner/repo TRIALS=20 ./start-latency.sh
+```
+
+`TRIALS=0` (the default) skips dispatching and only reads the current
+metrics, for fleets already under load. `FORGE_URL` and
+`AGENT_METRICS_URL` override the default local endpoints.
+
+Dispatches are sequential, so with a single worker and pool size 2 the
+pool refills between jobs and every trial in the warm scenario is a
+warm start; confirm with the reported hit count. Quote the number with
+the host hardware, the scenario (warm or cold), and the trial count.
 
 ## CI speedup vs hosted runners
 
