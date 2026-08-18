@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+
+	"github.com/CharlesBai-blc/forge/internal/sandbox"
 )
 
 // StatusError is a control-plane HTTP failure for a status report.
@@ -104,6 +106,25 @@ func (c *Client) Claim(ctx context.Context) (*ClaimResponse, error) {
 	var out ClaimResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("api: claim decode: %w", err)
+	}
+	return &out, nil
+}
+
+// Spec fetches the control plane's current sandbox configuration, used
+// to pre-create warm sandboxes before any claim arrives (FR-16).
+func (c *Client) Spec(ctx context.Context) (*sandbox.Spec, error) {
+	resp, err := c.do(ctx, http.MethodGet, "/v1/agents/"+c.WorkerID+"/spec", nil, "")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("api: spec: status %d: %s", resp.StatusCode, bytes.TrimSpace(b))
+	}
+	var out sandbox.Spec
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("api: spec decode: %w", err)
 	}
 	return &out, nil
 }

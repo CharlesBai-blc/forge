@@ -21,6 +21,7 @@ import (
 	"github.com/CharlesBai-blc/forge/internal/store"
 	"github.com/CharlesBai-blc/forge/internal/stream"
 	"github.com/alicebob/miniredis/v2"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type fakeSandbox struct {
@@ -246,6 +247,7 @@ func waitDestroyed(t *testing.T, sb *fakeSandbox, want int) {
 func TestRunSucceeded(t *testing.T) {
 	p := &fakeProvider{sb: &fakeSandbox{id: "sb-1"}}
 	st, jobs, r, src, _ := openHarness(t, p)
+	missesBefore := testutil.ToFloat64(warmPoolMisses)
 	startRunner(t, r)
 
 	j := testJob("job-ok", 1)
@@ -269,6 +271,9 @@ func TestRunSucceeded(t *testing.T) {
 	}
 	if got.State != job.JobSucceeded {
 		t.Errorf("State = %s, want succeeded", got.State)
+	}
+	if misses := testutil.ToFloat64(warmPoolMisses) - missesBefore; misses != 1 {
+		t.Errorf("warm-pool misses added = %v, want 1 with no pool configured", misses)
 	}
 }
 

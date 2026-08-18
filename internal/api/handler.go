@@ -41,6 +41,8 @@ type Handler struct {
 	CPU         float64 // sandbox limits (FR-14); zero disables
 	MemoryBytes int64
 	PIDs        int64
+	DiskBytes   int64
+	Hardened    bool // FR-15 profile
 	LogDir      string
 	Log         *slog.Logger
 	ClaimWait   time.Duration
@@ -60,12 +62,14 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/agents/enroll", h.enroll)
 	mux.HandleFunc("POST /v1/agents/{id}/heartbeat", h.heartbeat)
 	mux.HandleFunc("GET /v1/agents/{id}/claim", h.claim)
+	mux.HandleFunc("GET /v1/agents/{id}/spec", h.spec)
 	mux.HandleFunc("POST /v1/jobs/{id}/attempts/{n}/status", h.status)
 	mux.HandleFunc("POST /v1/jobs/{id}/attempts/{n}/logs", h.logs)
 	mux.HandleFunc("GET /{$}", h.page)
 	mux.HandleFunc("GET /v1/dashboard", h.dashboard)
 	mux.HandleFunc("GET /v1/jobs/{id}", h.jobDetail)
 	mux.HandleFunc("GET /v1/jobs/{id}/logs/stream", h.logStream)
+	mux.Handle("GET /metrics", h.metricsHandler())
 }
 
 func (h *Handler) log() *slog.Logger {
@@ -131,6 +135,31 @@ func (h *Handler) heartbeat(w http.ResponseWriter, r *http.Request) {
 	h.hbs[wk.ID] = running
 	h.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// jobSpec is the sandbox configuration delivered with every claim and
+// via GET /v1/agents/{id}/spec, which agents use to pre-create warm
+// sandboxes before any job arrives (FR-16).
+func (h *Handler) jobSpec() sandbox.Spec {
+	return sandbox.Spec{
+		Image:       h.Image,
+		Command:     h.Command,
+		CPU:         h.CPU,
+		MemoryBytes: h.MemoryBytes,
+		PIDs:        h.PIDs,
+		DiskBytes:   h.DiskBytes,
+		Hardened:    h.Hardened,
+	}
+}
+
+func (h *Handler) spec(w http.ResponseWriter, r *http.Request) {
+	wk, ok := h.worker(r)
+	if !ok || r.PathValue("id") != wk.ID {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(h.jobSpec())
 }
 
 func (h *Handler) worker(r *http.Request) (*job.Worker, bool) {
@@ -241,13 +270,7 @@ func (h *Handler) claim(w http.ResponseWriter, r *http.Request) {
 		JobID:   assigned.ID,
 		Attempt: assigned.Attempt,
 		JIT:     jit.Encoded,
-		Spec: sandbox.Spec{
-			Image:       h.Image,
-			Command:     h.Command,
-			CPU:         h.CPU,
-			MemoryBytes: h.MemoryBytes,
-			PIDs:        h.PIDs,
-		},
+		Spec:    h.jobSpec(),
 	})
 }
 
@@ -355,12 +378,14 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			h.statusStoreError(w, jobID, err)
 			return
 		}
+		jobLatencySeconds.WithLabelValues("queued_to_running").Observe(time.Since(j.CreatedAt).Seconds())
 		h.forgetJIT(jobID, false)
 	case job.JobSucceeded:
 		if err := h.Store.Transition(r.Context(), jobID, job.JobSucceeded, rep.Reason); err != nil {
 			h.statusStoreError(w, jobID, err)
 			return
 		}
+		jobLatencySeconds.WithLabelValues("total").Observe(time.Since(j.CreatedAt).Seconds())
 		h.forgetJIT(jobID, false)
 		h.ackJob(jobID)
 	case job.JobFailed:
@@ -401,6 +426,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			h.statusStoreError(w, jobID, err)
 			return
 		}
+		jobLatencySeconds.WithLabelValues("total").Observe(time.Since(j.CreatedAt).Seconds())
 		h.forgetJIT(jobID, false)
 		h.ackJob(jobID)
 	default:

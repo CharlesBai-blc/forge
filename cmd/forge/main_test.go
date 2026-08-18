@@ -106,7 +106,7 @@ func TestJobCommandDefaultsToRunnerJIT(t *testing.T) {
 	if len(got) != 3 || got[0] != "sh" || got[1] != "-c" {
 		t.Fatalf("jobCommand(nil) = %v", got)
 	}
-	if got[2] != `./run.sh --jitconfig "$(cat /jitconfig)"` {
+	if got[2] != `while [ ! -f /jitconfig ]; do sleep 0.2; done; exec ./run.sh --jitconfig "$(cat /jitconfig)"` {
 		t.Fatalf("script = %q", got[2])
 	}
 	if got := jobCommand([]string{"true"}); len(got) != 1 || got[0] != "true" {

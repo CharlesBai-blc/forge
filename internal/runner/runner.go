@@ -26,6 +26,7 @@ const (
 type Runner struct {
 	Client         *api.Client
 	Provider       sandbox.Provider
+	Pool           *Pool // optional warm pool (FR-16)
 	Log            *slog.Logger
 	HeartbeatEvery time.Duration
 	Outbox         *Outbox
@@ -176,10 +177,32 @@ func (r *Runner) runOne(ctx context.Context, cl *api.ClaimResponse) {
 		r.report(ctx, cl.JobID, cl.Attempt, rep)
 	}
 
-	sb, err := r.Provider.Create(ctx, cl.Spec)
-	if err != nil {
-		report(api.StatusReport{State: job.JobFailed, Reason: "sandbox_error: " + err.Error()})
-		return
+	// Warm path: take a pre-started sandbox so only credential
+	// injection remains (FR-16). Falls through to a cold Create when
+	// the pool is empty or the claim's spec differs.
+	var (
+		sb   sandbox.Sandbox
+		warm bool
+	)
+	if r.Pool != nil {
+		r.Pool.SetSpec(cl.Spec)
+		sb, warm = r.Pool.Take(cl.Spec)
+	}
+	if warm {
+		warmPoolHits.Inc()
+	} else {
+		// A disabled or empty pool is still a miss: every claim must
+		// contribute to FR-25's warm-pool hit rate denominator.
+		warmPoolMisses.Inc()
+	}
+	startAt := time.Now()
+	if sb == nil {
+		var err error
+		sb, err = r.Provider.Create(ctx, cl.Spec)
+		if err != nil {
+			report(api.StatusReport{State: job.JobFailed, Reason: "sandbox_error: " + err.Error()})
+			return
+		}
 	}
 	defer func() {
 		if err := sb.Destroy(context.Background()); err != nil {
@@ -191,6 +214,7 @@ func (r *Runner) runOne(ctx context.Context, cl *api.ClaimResponse) {
 		report(api.StatusReport{State: job.JobFailed, Reason: "start: " + err.Error()})
 		return
 	}
+	observeSandboxStart(warm, time.Since(startAt))
 	report(api.StatusReport{State: job.JobRunning})
 
 	stop := r.startLogStream(ctx, sb, cl)
