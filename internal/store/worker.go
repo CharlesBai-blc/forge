@@ -55,11 +55,14 @@ func (s *Store) Enroll(ctx context.Context, token, name, arch, version string) (
 	}
 	defer tx.Rollback()
 
-	var expiresAt, usedAt sql.NullString
+	var (
+		expiresAt, usedAt sql.NullString
+		burst             int
+	)
 	err = tx.QueryRowContext(ctx, `
-		SELECT expires_at, used_at FROM enrollment_tokens WHERE token_hash = ?`,
+		SELECT expires_at, used_at, burst FROM enrollment_tokens WHERE token_hash = ?`,
 		hashToken(token),
-	).Scan(&expiresAt, &usedAt)
+	).Scan(&expiresAt, &usedAt, &burst)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", ErrEnrollmentInvalid
 	}
@@ -90,11 +93,13 @@ func (s *Store) Enroll(ctx context.Context, token, name, arch, version string) (
 		return "", "", fmt.Errorf("store: marshal labels: %w", err)
 	}
 	now := time.Now().UTC()
+	// A token pre-issued by the burst controller marks the worker as
+	// burst-provisioned (FR-21).
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO workers (id, name, labels, capacity, state, burst, healthy, last_seen, token_hash, arch, version)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		workerID, name, string(labels), 1, string(job.WorkerActive), 0, 1,
-		formatTime(now), hashToken(machineToken), arch, version)
+		INSERT INTO workers (id, name, labels, capacity, state, burst, healthy, last_seen, token_hash, arch, version, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		workerID, name, string(labels), 1, string(job.WorkerActive), burst, 1,
+		formatTime(now), hashToken(machineToken), arch, version, formatTime(now))
 	if err != nil {
 		return "", "", fmt.Errorf("store: insert worker: %w", err)
 	}
