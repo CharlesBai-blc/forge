@@ -8,7 +8,7 @@ import (
 )
 
 // Spec is the per-job sandbox configuration.
-// Command is the process to run. Hardened is unused until M4.
+// Command is the process to run. Hardened selects the FR-15 profile.
 type Spec struct {
 	Image       string   `json:"image"`
 	Command     []string `json:"command,omitempty"`
@@ -44,4 +44,12 @@ type Sandbox interface {
 	// Destroy force-removes the sandbox and its writable layer.
 	// Idempotent. No Reset or Release (FR-13).
 	Destroy(ctx context.Context) error
+}
+
+// Warmable is a Sandbox that can be started before a job attaches, so a
+// later Start only injects the credential (FR-16). Warm sandboxes remain
+// single-use: WarmStart does not consume Start's once-only guard, and a
+// warmed sandbox still runs exactly one job before Destroy.
+type Warmable interface {
+	WarmStart(ctx context.Context) error
 }

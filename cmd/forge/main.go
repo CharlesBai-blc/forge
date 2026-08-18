@@ -39,6 +39,8 @@ type config struct {
 	cpu           float64
 	memoryMB      int64
 	pids          int64
+	diskMB        int64
+	hardened      bool
 }
 
 func main() {
@@ -75,6 +77,8 @@ func parseFlags() config {
 	cpu := flag.Float64("cpu", envOrFloat("FORGE_JOB_CPU", defaultCPU), "sandbox CPU limit in cores; 0 disables (FR-14)")
 	memoryMB := flag.Int64("memory-mb", envOrInt("FORGE_JOB_MEMORY_MB", defaultMemoryMB), "sandbox memory limit in MiB; 0 disables (FR-14)")
 	pids := flag.Int64("pids", envOrInt("FORGE_JOB_PIDS", defaultPIDs), "sandbox PID limit; 0 disables (FR-14)")
+	diskMB := flag.Int64("disk-mb", envOrInt("FORGE_JOB_DISK_MB", defaultDiskMB), "sandbox writable-layer quota in MiB; 0 disables; storage-driver dependent (FR-14)")
+	hardened := flag.Bool("hardened", envOrBool("FORGE_JOB_HARDENED", true), "hardened sandbox profile (FR-15)")
 	flag.Parse()
 	return config{
 		addr:          *addr,
@@ -90,6 +94,8 @@ func parseFlags() config {
 		cpu:           *cpu,
 		memoryMB:      *memoryMB,
 		pids:          *pids,
+		diskMB:        *diskMB,
+		hardened:      *hardened,
 	}
 }
 
@@ -98,6 +104,7 @@ const (
 	defaultCPU      = 2.0
 	defaultMemoryMB = 4096
 	defaultPIDs     = 4096
+	defaultDiskMB   = 20480 // 20 GiB writable layer, enforced with FR-15 where the driver allows
 )
 
 func envOr(key, fallback string) string {
@@ -131,13 +138,28 @@ func envOrInt(key string, fallback int64) int64 {
 	return n
 }
 
+func envOrBool(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
+}
+
 // jobCommand is the sandbox process. Empty means the official
-// actions/runner JIT invocation (FR-6).
+// actions/runner JIT invocation (FR-6). The default waits for
+// /jitconfig so warm sandboxes can start before a job attaches and
+// idle until the credential is injected (FR-16); on the cold path the
+// file is copied in before start, so the loop exits immediately.
 func jobCommand(cmd []string) []string {
 	if len(cmd) > 0 {
 		return cmd
 	}
-	return []string{"sh", "-c", `./run.sh --jitconfig "$(cat /jitconfig)"`}
+	return []string{"sh", "-c", `while [ ! -f /jitconfig ]; do sleep 0.2; done; exec ./run.sh --jitconfig "$(cat /jitconfig)"`}
 }
 
 func (c config) validate() error {
@@ -298,6 +320,8 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.Runner
 		CPU:         cfg.cpu,
 		MemoryBytes: cfg.memoryMB << 20,
 		PIDs:        cfg.pids,
+		DiskBytes:   cfg.diskMB << 20,
+		Hardened:    cfg.hardened,
 		LogDir:      filepath.Join(cfg.dataDir, "logs"),
 		Log:         log,
 	}
