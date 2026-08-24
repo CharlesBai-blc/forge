@@ -1,0 +1,8 @@
+name: burst-flood
+on:
+  workflow_dispatch:
+jobs:
+  flood:
+    runs-on: [self-hosted, forge]
+    steps:
+      - run: sleep 30
