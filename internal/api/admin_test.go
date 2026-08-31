@@ -83,8 +83,8 @@ func TestSessionGatesDashboardRoutes(t *testing.T) {
 
 func TestSessionExpires(t *testing.T) {
 	_, _, _, c, _, h := openAPI(t, nil)
-	h.SessionTTL = 50 * time.Millisecond
-	hc := adminHTTP(t, c.BaseURL)
+	h.SessionTTL = 500 * time.Millisecond
+	hc := adminHTTP(t, c.BaseURL) // includes a real Argon2id login; leave TTL headroom for that
 
 	resp, err := hc.Get(c.BaseURL + "/v1/dashboard")
 	if err != nil {
@@ -95,7 +95,7 @@ func TestSessionExpires(t *testing.T) {
 		t.Fatalf("fresh session: status = %d", resp.StatusCode)
 	}
 
-	time.Sleep(80 * time.Millisecond)
+	time.Sleep(700 * time.Millisecond)
 	resp, err = hc.Get(c.BaseURL + "/v1/dashboard")
 	if err != nil {
 		t.Fatal(err)
