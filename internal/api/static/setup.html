@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Forge - Setup</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 14px/1.45 system-ui, sans-serif; margin: 1.25rem; max-width: 28rem; }
+    h1 { font-size: 1.35rem; margin: 0 0 0.25rem; }
+    h2 { font-size: 1.05rem; margin: 1.5rem 0 0.25rem; }
+    label { display: block; margin: 0.75rem 0 0.25rem; }
+    input { width: 100%; padding: 0.4rem 0.5rem; font: inherit; box-sizing: border-box; }
+    button { margin-top: 1.25rem; padding: 0.45rem 1rem; font: inherit; cursor: pointer; }
+    .muted { opacity: 0.7; }
+    .err { color: #c0392b; margin-top: 0.75rem; min-height: 1.2em; }
+  </style>
+</head>
+<body>
+  <h1>Forge setup</h1>
+  <p class="muted">First run: create the admin account (FR-2). This form works once.</p>
+  <form id="f">
+    <h2>Admin account</h2>
+    <label for="username">Username</label>
+    <input id="username" autocomplete="username" required>
+    <label for="password">Password (8+ characters)</label>
+    <input id="password" type="password" autocomplete="new-password" minlength="8" required>
+
+    <h2>GitHub credentials <span class="muted">(optional if already set via flags)</span></h2>
+    <label for="webhook">Webhook secret</label>
+    <input id="webhook" autocomplete="off">
+    <label for="token">GitHub token (PAT or installation token)</label>
+    <input id="token" type="password" autocomplete="off">
+
+    <button type="submit">Finish setup</button>
+    <p class="err" id="err"></p>
+  </form>
+  <script>
+    document.getElementById('f').addEventListener('submit', async e => {
+      e.preventDefault();
+      const r = await fetch('/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: document.getElementById('username').value,
+          password: document.getElementById('password').value,
+          webhook_secret: document.getElementById('webhook').value,
+          github_token: document.getElementById('token').value
+        })
+      });
+      if (r.ok) { location.reload(); return; }
+      document.getElementById('err').textContent =
+        'Setup failed (' + r.status + '): ' + (await r.text());
+    });
+  </script>
+</body>
+</html>

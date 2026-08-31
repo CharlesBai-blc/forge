@@ -19,8 +19,40 @@ var dashboardFS embed.FS
 
 const defaultLogPoll = 200 * time.Millisecond
 
-func (h *Handler) page(w http.ResponseWriter, _ *http.Request) {
-	b, err := dashboardFS.ReadFile("static/index.html")
+// page redirects to setup before an admin exists (FR-2), serves the
+// login page without a session, and the dashboard otherwise (tdd.md §7).
+func (h *Handler) page(w http.ResponseWriter, r *http.Request) {
+	name := "static/index.html"
+	if pending, err := h.SetupPending(r.Context()); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	} else if pending {
+		http.Redirect(w, r, "/setup", http.StatusSeeOther)
+		return
+	} else if !h.session(r) {
+		name = "static/login.html"
+	}
+	b, err := dashboardFS.ReadFile(name)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(b)
+}
+
+// setupPage exists only until the first admin account is created.
+func (h *Handler) setupPage(w http.ResponseWriter, r *http.Request) {
+	pending, err := h.SetupPending(r.Context())
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !pending {
+		http.NotFound(w, r)
+		return
+	}
+	b, err := dashboardFS.ReadFile("static/setup.html")
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -62,6 +94,10 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out.Workers = append(out.Workers, dashboardWorker(wk, len(running)))
+	}
+	if h.BurstStatus != nil {
+		s := h.BurstStatus(ctx)
+		out.Burst = &s
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
@@ -219,5 +255,6 @@ func dashboardWorker(w *job.Worker, running int) DashboardWorker {
 		LastSeen:    w.LastSeen,
 		Arch:        w.Arch,
 		Utilization: util,
+		Burst:       w.Burst,
 	}
 }

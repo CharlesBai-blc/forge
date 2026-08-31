@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/CharlesBai-blc/forge/internal/api"
+	"github.com/CharlesBai-blc/forge/internal/burst"
 	"github.com/CharlesBai-blc/forge/internal/job"
 	"github.com/CharlesBai-blc/forge/internal/secret"
 	"github.com/CharlesBai-blc/forge/internal/source"
@@ -41,6 +42,17 @@ type config struct {
 	pids          int64
 	diskMB        int64
 	hardened      bool
+	adminUser     string
+	adminPassword string
+	burstDir      string
+	burstURL      string
+	burstAgentURL string
+	burstMax      int64
+	burstMaxHours float64
+	burstUp       time.Duration
+	burstDown     time.Duration
+	burstBelow    int64
+	terraformBin  string
 }
 
 func main() {
@@ -79,6 +91,17 @@ func parseFlags() config {
 	pids := flag.Int64("pids", envOrInt("FORGE_JOB_PIDS", defaultPIDs), "sandbox PID limit; 0 disables (FR-14)")
 	diskMB := flag.Int64("disk-mb", envOrInt("FORGE_JOB_DISK_MB", defaultDiskMB), "sandbox writable-layer quota in MiB; 0 disables; storage-driver dependent (FR-14)")
 	hardened := flag.Bool("hardened", envOrBool("FORGE_JOB_HARDENED", true), "hardened sandbox profile (FR-15)")
+	adminUser := flag.String("admin-user", os.Getenv("FORGE_ADMIN_USER"), "seed the admin account for scripted installs (FR-2)")
+	adminPassword := flag.String("admin-password", os.Getenv("FORGE_ADMIN_PASSWORD"), "seed admin password; 8+ characters (FR-2)")
+	burstDir := flag.String("burst-dir", envOr("FORGE_BURST_DIR", ""), "terraform module directory; empty disables burst (FR-21)")
+	burstURL := flag.String("burst-url", envOr("FORGE_BURST_URL", ""), "control plane URL reachable from burst instances (FR-21)")
+	burstAgentURL := flag.String("burst-agent-url", envOr("FORGE_BURST_AGENT_URL", ""), "URL of the linux/arm64 forge-agent binary for burst bootstrap (FR-21)")
+	burstMax := flag.Int64("burst-max-instances", envOrInt("FORGE_BURST_MAX_INSTANCES", burst.DefaultMaxInstances), "burst instance cap (FR-23)")
+	burstMaxHours := flag.Float64("burst-max-hours", envOrFloat("FORGE_BURST_MAX_HOURS", burst.DefaultMaxHoursPerDay), "burst instance-hours per day cap (FR-23)")
+	burstUp := flag.Duration("burst-up-window", envOrDuration("FORGE_BURST_UP_WINDOW", burst.DefaultUpWindow), "sustained backlog before scale-up (FR-21)")
+	burstDown := flag.Duration("burst-down-window", envOrDuration("FORGE_BURST_DOWN_WINDOW", burst.DefaultDownWindow), "sustained low queue before scale-down (FR-22)")
+	burstBelow := flag.Int64("burst-down-threshold", envOrInt("FORGE_BURST_DOWN_THRESHOLD", burst.DefaultDownThreshold), "queue depth below which the scale-down window accrues (FR-22)")
+	terraformBin := flag.String("terraform", envOr("FORGE_TERRAFORM", "terraform"), "terraform binary for burst")
 	flag.Parse()
 	return config{
 		addr:          *addr,
@@ -96,6 +119,17 @@ func parseFlags() config {
 		pids:          *pids,
 		diskMB:        *diskMB,
 		hardened:      *hardened,
+		adminUser:     *adminUser,
+		adminPassword: *adminPassword,
+		burstDir:      *burstDir,
+		burstURL:      *burstURL,
+		burstAgentURL: *burstAgentURL,
+		burstMax:      *burstMax,
+		burstMaxHours: *burstMaxHours,
+		burstUp:       *burstUp,
+		burstDown:     *burstDown,
+		burstBelow:    *burstBelow,
+		terraformBin:  *terraformBin,
 	}
 }
 
@@ -150,6 +184,18 @@ func envOrBool(key string, fallback bool) bool {
 	return b
 }
 
+func envOrDuration(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fallback
+	}
+	return d
+}
+
 // jobCommand is the sandbox process. Empty means the official
 // actions/runner JIT invocation (FR-6). The default waits for
 // /jitconfig so warm sandboxes can start before a job attaches and
@@ -171,6 +217,12 @@ func (c config) validate() error {
 	}
 	if c.dataDir == "" {
 		return fmt.Errorf("forge: -data-dir is required")
+	}
+	if c.burstDir != "" && c.burstURL == "" {
+		return fmt.Errorf("forge: -burst-url is required with -burst-dir (FR-21)")
+	}
+	if c.burstDir != "" && c.burstAgentURL == "" {
+		return fmt.Errorf("forge: -burst-agent-url is required with -burst-dir (FR-21)")
 	}
 	return nil
 }
@@ -231,6 +283,7 @@ type app struct {
 	mux    *http.ServeMux
 	stream *stream.Stream
 	api    *api.Handler
+	burst  *burst.Controller
 }
 
 func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.RunnerSource) (*app, error) {
@@ -250,18 +303,28 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.Runner
 		st.Close()
 		return nil, err
 	}
+	if err := seedAdmin(ctx, st, cfg.adminUser, cfg.adminPassword); err != nil {
+		st.Close()
+		return nil, err
+	}
+	// With credentials, the GitHub source is live immediately. Without,
+	// start in setup-pending mode: the web setup flow provides them and
+	// activates the source without a restart (FR-2).
+	var holder *credSource
 	if src == nil {
-		if err := cfg.validateCreds(); err != nil {
-			st.Close()
-			return nil, err
+		holder = &credSource{}
+		if err := cfg.validateCreds(); err == nil {
+			holder.Set(&github.Source{
+				Secret: cfg.webhookSecret,
+				Token:  cfg.githubToken,
+				Owner:  cfg.githubOwner,
+				Repo:   cfg.githubRepo,
+				Org:    cfg.githubOrg,
+			})
+		} else {
+			log.Warn("forge: GitHub credentials not configured; finish setup in the browser (FR-2)", "err", err)
 		}
-		src = &github.Source{
-			Secret: cfg.webhookSecret,
-			Token:  cfg.githubToken,
-			Owner:  cfg.githubOwner,
-			Repo:   cfg.githubRepo,
-			Org:    cfg.githubOrg,
-		}
+		src = holder
 	}
 	jobs, err := stream.Open(ctx, cfg.redis)
 	if err != nil {
@@ -325,8 +388,42 @@ func newApp(ctx context.Context, cfg config, log *slog.Logger, src source.Runner
 		LogDir:      filepath.Join(cfg.dataDir, "logs"),
 		Log:         log,
 	}
+	if holder != nil {
+		apiH.SaveCreds = saveCreds(st, key, cfg, holder)
+	}
+	var bc *burst.Controller
+	if cfg.burstDir != "" {
+		bc = &burst.Controller{
+			Store: st,
+			Terraform: &burst.CLI{
+				Bin: cfg.terraformBin,
+				Dir: cfg.burstDir,
+				StaticVars: map[string]string{
+					"agent_download_url": cfg.burstAgentURL,
+				},
+				Log: log,
+			},
+			Log:             log,
+			ControlPlaneURL: cfg.burstURL,
+			UpWindow:        cfg.burstUp,
+			DownWindow:      cfg.burstDown,
+			DownThreshold:   int(cfg.burstBelow),
+			MaxInstances:    int(cfg.burstMax),
+			MaxHoursPerDay:  cfg.burstMaxHours,
+		}
+		apiH.BurstStatus = func(ctx context.Context) api.BurstStatus {
+			s := bc.Status(ctx)
+			return api.BurstStatus{
+				Instances:      s.Instances,
+				MaxInstances:   s.MaxInstances,
+				HoursToday:     s.HoursToday,
+				MaxHoursPerDay: s.MaxHoursPerDay,
+				Banner:         s.Banner,
+			}
+		}
+	}
 	apiH.Register(mux)
-	return &app{store: st, mux: mux, stream: jobs, api: apiH}, nil
+	return &app{store: st, mux: mux, stream: jobs, api: apiH, burst: bc}, nil
 }
 
 func (a *app) Close() error {
@@ -347,6 +444,9 @@ func run(ctx context.Context, cfg config, log *slog.Logger) error {
 	defer a.Close()
 
 	go a.api.RunSweep(ctx)
+	if a.burst != nil {
+		go a.burst.Run(ctx)
+	}
 
 	srv := &http.Server{Addr: cfg.addr, Handler: a.mux}
 	go func() {

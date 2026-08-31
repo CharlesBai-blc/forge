@@ -17,7 +17,23 @@ import (
 
 func TestDashboardPage(t *testing.T) {
 	_, _, _, c, _, _ := openAPI(t, nil)
+
+	// Without a session the page route serves the login form (tdd.md §7).
 	resp, err := http.Get(c.BaseURL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if !bytes.Contains(b, []byte("Log in")) || bytes.Contains(b, []byte("Queue depth")) {
+		t.Fatalf("expected login page, got: %.100s", b)
+	}
+
+	hc := adminHTTP(t, c.BaseURL)
+	resp, err = hc.Get(c.BaseURL + "/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +45,7 @@ func TestDashboardPage(t *testing.T) {
 	if !strings.Contains(ct, "text/html") {
 		t.Fatalf("Content-Type = %q", ct)
 	}
-	b, _ := io.ReadAll(resp.Body)
+	b, _ = io.ReadAll(resp.Body)
 	if !bytes.Contains(b, []byte("Queue depth")) {
 		t.Fatalf("body missing queue depth")
 	}
@@ -47,7 +63,8 @@ func TestDashboardJSON(t *testing.T) {
 		t.Fatalf("running: %v", err)
 	}
 
-	resp, err := http.Get(c.BaseURL + "/v1/dashboard")
+	hc := adminHTTP(t, c.BaseURL)
+	resp, err := hc.Get(c.BaseURL + "/v1/dashboard")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +128,8 @@ func TestDashboardDeadLetter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, err := http.Get(c.BaseURL + "/v1/dashboard")
+	hc := adminHTTP(t, c.BaseURL)
+	resp, err := hc.Get(c.BaseURL + "/v1/dashboard")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +149,7 @@ func TestDashboardDeadLetter(t *testing.T) {
 		t.Fatalf("dead letter job = %+v", found)
 	}
 
-	detail, err := http.Get(c.BaseURL + "/v1/jobs/job-dl")
+	detail, err := hc.Get(c.BaseURL + "/v1/jobs/job-dl")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +184,8 @@ func TestLogStream(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, err := http.Get(c.BaseURL + "/v1/jobs/job-log/logs/stream")
+	hc := adminHTTP(t, c.BaseURL)
+	resp, err := hc.Get(c.BaseURL + "/v1/jobs/job-log/logs/stream")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +230,7 @@ func TestLogStreamLastEventID(t *testing.T) {
 		t.Fatal(err)
 	}
 	req.Header.Set("Last-Event-ID", "6")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := adminHTTP(t, c.BaseURL).Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +249,7 @@ func TestLogStreamLastEventID(t *testing.T) {
 
 func TestJobDetailNotFound(t *testing.T) {
 	_, _, _, c, _, _ := openAPI(t, nil)
-	resp, err := http.Get(c.BaseURL + "/v1/jobs/missing")
+	resp, err := adminHTTP(t, c.BaseURL).Get(c.BaseURL + "/v1/jobs/missing")
 	if err != nil {
 		t.Fatal(err)
 	}

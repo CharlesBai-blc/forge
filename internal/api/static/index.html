@@ -11,18 +11,27 @@
     h2 { font-size: 1.05rem; margin: 1.25rem 0 0.4rem; }
     table { border-collapse: collapse; width: 100%; }
     th, td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
-    tbody tr { cursor: pointer; }
-    tbody tr:hover, tbody tr.sel { background: color-mix(in srgb, currentColor 8%, transparent); }
+    tbody tr { cursor: default; }
+    #jobs tr { cursor: pointer; }
+    #jobs tr:hover, #jobs tr.sel { background: color-mix(in srgb, currentColor 8%, transparent); }
     pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
     pre { white-space: pre-wrap; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); padding: 0.75rem; overflow: auto; max-height: 22rem; }
     .muted { opacity: 0.7; }
     .row { display: flex; gap: 2rem; flex-wrap: wrap; }
     .row > * { flex: 1 1 18rem; }
+    .top { display: flex; justify-content: space-between; align-items: baseline; }
+    .banner { border: 1px solid #c0392b; color: #c0392b; padding: 0.5rem 0.75rem; margin: 0.75rem 0; display: none; }
+    button.small { font: inherit; font-size: 12px; padding: 0.1rem 0.5rem; cursor: pointer; margin-right: 0.25rem; }
+    #logout { font: inherit; font-size: 12px; padding: 0.2rem 0.75rem; cursor: pointer; }
   </style>
 </head>
 <body>
-  <h1>Forge</h1>
+  <div class="top">
+    <h1>Forge</h1>
+    <button id="logout">Log out</button>
+  </div>
   <p>Queue depth: <strong id="queue">0</strong></p>
+  <div class="banner" id="burst-banner"></div>
 
   <h2>Bootstrap a worker</h2>
   <p class="muted">Mint a one-time token on the control plane, then run the agent on the new machine (FR-3).</p>
@@ -39,8 +48,13 @@
     <section>
       <h2>Workers</h2>
       <table>
-        <thead><tr><th>Name</th><th>State</th><th>Healthy</th><th>Running</th><th>Util</th></tr></thead>
+        <thead><tr><th>Name</th><th>State</th><th>Healthy</th><th>Running</th><th>Util</th><th>Actions</th></tr></thead>
         <tbody id="workers"></tbody>
+      </table>
+      <h2>Burst <span class="muted" id="burst-off">not configured</span></h2>
+      <table id="burst-table" style="display:none">
+        <thead><tr><th>Instances</th><th>Max</th><th>Hours today</th><th>Max hours/day</th></tr></thead>
+        <tbody id="burst"></tbody>
       </table>
     </section>
   </div>
@@ -79,8 +93,22 @@
     }
     function mark(s) { return s ? 'yes' : 'no'; }
 
+    // Fleet controls (FR-19); remove also revokes the machine token (FR-27).
+    function actions(w) {
+      const b = [];
+      if (w.state === 'active') b.push('cordon', 'drain');
+      if (w.state === 'cordoned') b.push('uncordon', 'drain', 'remove');
+      if (w.state === 'draining') b.push('cordon');
+      if (w.state === 'lost') b.push('remove');
+      return b.map(a =>
+        '<button class="small" data-worker="' + esc(w.id) + '" data-action="' + a + '">' + a + '</button>'
+      ).join('');
+    }
+
     async function refresh() {
-      const d = await (await fetch('/v1/dashboard')).json();
+      const r = await fetch('/v1/dashboard');
+      if (r.status === 401) { location.reload(); return; }
+      const d = await r.json();
       document.getElementById('queue').textContent = d.queue_depth;
       document.getElementById('jobs').innerHTML = (d.jobs || []).map(j => {
         const tag = j.dead_lettered ? ' failed (dead letter)' : '';
@@ -93,10 +121,24 @@
           '<td>' + dur(j.duration_ms) + '</td></tr>';
       }).join('');
       document.getElementById('workers').innerHTML = (d.workers || []).map(w =>
-        '<tr><td>' + esc(w.name) + '</td><td>' + esc(w.state) +
+        '<tr><td>' + esc(w.name) + (w.burst ? ' <span class="muted">(burst)</span>' : '') +
+        '</td><td>' + esc(w.state) +
         '</td><td>' + mark(w.healthy) + '</td><td>' + w.running + '/' + w.capacity +
-        '</td><td>' + Math.round((w.utilization || 0) * 100) + '%</td></tr>'
+        '</td><td>' + Math.round((w.utilization || 0) * 100) + '%</td>' +
+        '<td>' + actions(w) + '</td></tr>'
       ).join('');
+      const banner = document.getElementById('burst-banner');
+      if (d.burst) {
+        document.getElementById('burst-off').style.display = 'none';
+        document.getElementById('burst-table').style.display = '';
+        document.getElementById('burst').innerHTML =
+          '<tr><td>' + d.burst.instances + '</td><td>' + d.burst.max_instances +
+          '</td><td>' + d.burst.hours_today.toFixed(2) + '</td><td>' + d.burst.max_hours_per_day + '</td></tr>';
+        banner.style.display = d.burst.banner ? 'block' : 'none';
+        banner.textContent = d.burst.banner ? 'Burst: ' + d.burst.banner : '';
+      } else {
+        banner.style.display = 'none';
+      }
     }
 
     async function openJob(id) {
@@ -126,6 +168,19 @@
     document.getElementById('jobs').addEventListener('click', e => {
       const tr = e.target.closest('tr[data-id]');
       if (tr) openJob(tr.dataset.id);
+    });
+    document.getElementById('workers').addEventListener('click', async e => {
+      const b = e.target.closest('button[data-worker]');
+      if (!b) return;
+      if (b.dataset.action === 'remove' && !confirm('Remove worker and revoke its token?')) return;
+      const r = await fetch('/v1/admin/workers/' + encodeURIComponent(b.dataset.worker) +
+        '/' + b.dataset.action, { method: 'POST' });
+      if (!r.ok && r.status !== 401) alert(b.dataset.action + ' failed: ' + await r.text());
+      refresh();
+    });
+    document.getElementById('logout').addEventListener('click', async () => {
+      await fetch('/v1/admin/logout', { method: 'POST' });
+      location.reload();
     });
     refresh();
     setInterval(refresh, 2000);
