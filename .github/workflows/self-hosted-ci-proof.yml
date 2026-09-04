@@ -1,0 +1,19 @@
+name: self-hosted-ci-proof
+# One-off proof that Forge can run this repo's own build/vet/test on a
+# real self-hosted worker (M5 acceptance: "Forge runs its own CI").
+# Not the required PR check -- ci.yml stays on ubuntu-latest until the
+# self-hosted fleet has proven continuously available, per
+# docs/m5-aws-handoff.md.
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: [self-hosted, forge]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
