@@ -330,7 +330,12 @@ func TestRegisterJITErrorLeavesQueued(t *testing.T) {
 }
 
 func TestClaimAfterRestartFromAssigned(t *testing.T) {
-	st, jobs, _, c, src, _ := openAPI(t, nil)
+	st, jobs, _, c, src, h := openAPI(t, nil)
+	// The second Claim below falls through redelivery + requeue (several
+	// synchronous store writes) before its retry read; the package's
+	// default 50ms ClaimWait can be outrun by that on a loaded CI
+	// runner, so give this one more headroom.
+	h.ClaimWait = 2 * time.Second
 	putQueued(t, st, jobs, testJob("job-restart", 40))
 	cl, err := c.Claim(context.Background())
 	if err != nil {
